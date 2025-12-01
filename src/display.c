@@ -14,13 +14,44 @@
 
 #define DISPLAY_FD (STDOUT_FILENO)
 #define eprintf(...) \
-	if (dprintf(DISPLAY_FD, __VA_ARGS__) < 0) return false
+	if (dprintf(DISPLAY_FD, __VA_ARGS__) < 0) goto fail
 
-static struct termios termios;
+struct display_screen {
+	union {
+		struct poss size;
+		struct {
+			size_t w, h;
+		};
+	};
+	size_t buf_size;
+	char *buf;
+};
+
+#define INDEX(pos, screen) ((size_t) (pos.y) * (size_t) (screen.w) + (size_t) (pos.x))
+#define INDEX_CHAR(pos, screen) (INDEX(pos, screen) / CHAR_BIT)
+#define INDEX_BIT(pos, screen) (1 << (INDEX(pos, screen) % CHAR_BIT)) // returns bit mask
+#define SCREEN_BUF_SIZE(screen) (((screen.w * screen.h) + CHAR_BIT - 1) / CHAR_BIT)
+
+#define SET_BIT(char, mask, set) ((set) ? (char) | (mask) : (char) &~(mask))
+#define GET_CELL(pos, screen) ((screen.buf[INDEX_CHAR(pos, screen)] & INDEX_BIT(pos, screen)) != 0)
+#define SET_CELL(pos, set, screen)                                                    \
+	if ((pos).x >= 0 && (pos).y >= 0 && (pos).x < (screen).w && (pos).y < (screen).h) \
+	(screen.buf[INDEX_CHAR(pos, screen)] = SET_BIT(screen.buf[INDEX_CHAR(pos, screen)], INDEX_BIT(pos, screen), set))
+
+static struct display_data {
+	struct termios old_termios;
+	struct poss term_size;
+	struct display_screen screen[2]; // double-buffered rendering
+	unsigned screen_index;
+} display;
+
+#define SCREEN (display.screen[display.screen_index])
+#define SCREEN_OTHER (display.screen[display.screen_index ^ 1])
+
 bool display_enable() {
-	if (tcgetattr(DISPLAY_FD, &termios)) return false;
+	if (tcgetattr(DISPLAY_FD, &display.old_termios)) return false;
 
-	struct termios new_termios = termios;
+	struct termios new_termios = display.old_termios;
 	cfmakeraw(&new_termios);     // stty raw
 	new_termios.c_lflag |= ISIG; // allow ^C = SIGINT, etc.
 
@@ -29,142 +60,147 @@ bool display_enable() {
 	eprintf("\x1b[?1049h"); // move to separate buffer
 	eprintf("\x1b[?7l");    // disable newline at end of line
 	eprintf("\x1b[?25l");   // hide cursor
+
+	display.screen[0].buf = NULL;
+	display.screen[1].buf = NULL;
+	display.screen_index = 0;
 	return true;
+fail:
+	return false;
 }
 
 bool display_disable() {
-	eprintf("\x1b[?25h");                                       // show cursor
-	eprintf("\x1b[?7h");                                        // re-enable newline at end of line
-	eprintf("\x1b[?1049l");                                     // restore buffer
-	if (tcsetattr(DISPLAY_FD, TCSANOW, &termios)) return false; // restore terminal settings
+	FREE(display.screen[0].buf);
+	FREE(display.screen[1].buf);
+	eprintf("\x1b[H");                                                      // move to start
+	eprintf("\x1b[2J");                                                     // clear
+	eprintf("\x1b[?25h");                                                   // show cursor
+	eprintf("\x1b[?7h");                                                    // re-enable newline at end of line
+	eprintf("\x1b[?1049l");                                                 // restore buffer
+	if (tcsetattr(DISPLAY_FD, TCSANOW, &display.old_termios)) return false; // restore terminal settings
 	return true;
+fail:
+	return false;
 }
 
-static struct rect get_fit_rect(struct pos inner_size, struct pos frame_size) {
-	// adapted from https://github.com/sophuric/Foto/blob/51413b512ad7f/src/util.c#L12-L37
+bool display_render(struct pendulum_chain *chain, const char *info) {
+	bool res = false;
 
-	// gets the fit mode rect for an inner and frame size
+	eprintf("\x1b[H"); // move to start
 
-	float scale;
+	struct winsize ioctl_term_size;
+	if (ioctl(DISPLAY_FD, TIOCGWINSZ, &ioctl_term_size)) return false; // get terminal size
 
-	// avoid division by zero
-	if (inner_size.x == 0.0f || inner_size.y == 0.0f || frame_size.x == 0.0f || frame_size.y == 0.0f)
-		return RECT(0, 0, 0, 0);
+	struct posf stretch = POSF(2, 1);
 
-	// get fit mode rect from inner and frame size
-	if (inner_size.x / inner_size.y > frame_size.x / frame_size.y) {
-		scale = frame_size.x / inner_size.x;
-		return RECT(0, (int) ((frame_size.y * 0.5f) - (inner_size.y * scale * 0.5f)), frame_size.x, (int) (scale * inner_size.y));
-	} else {
-		scale = frame_size.y / inner_size.y;
-		return RECT((int) ((frame_size.x * 0.5f) - (inner_size.x * scale * 0.5f)), 0, (int) (scale * inner_size.x), frame_size.y);
+	const static struct poss block_size = POSS(2, 2); // adjust code for producing block character if changing this
+
+	display.term_size = POSS(ioctl_term_size.ws_col, ioctl_term_size.ws_row);
+
+	// initialise new screen
+	display.screen_index ^= 1;
+	SCREEN.size = poss_mul(display.term_size, block_size);
+	size_t buf_size = SCREEN_BUF_SIZE(SCREEN);
+	bool needs_clear = true;
+	// see https://stackoverflow.com/a/39562813
+	if (SCREEN.buf == NULL || buf_size > SCREEN.buf_size) {
+		// create new buffer if it doesn't exist yet or we are scaling up
+		FREE(SCREEN.buf);
+		SCREEN.buf = calloc(1, buf_size);
+		needs_clear = false;
+	} else if (buf_size < SCREEN.buf_size) {
+		// realloc if we are scaling down
+		SCREEN.buf = realloc(SCREEN.buf, buf_size);
 	}
-}
+	if (!SCREEN.buf) goto fail;
 
-static struct pos get_fit_pos(struct pos inner_pos, struct pos inner_size, struct pos frame_size) {
-	struct rect rect = get_fit_rect(inner_size, frame_size);
-	return pos_add(pos_mul(pos_div(inner_pos, inner_size), rect.size), rect.pos);
-};
+	if (buf_size != SCREEN.buf_size) eprintf("\x1b[2J"); // clear on resize
 
-bool display_render(struct pendulum_chain *chain) {
-	eprintf("\x1b[H\x1b[2J"); // clear
+	SCREEN.buf_size = buf_size;
 
-	struct winsize term_size;
-	if (ioctl(DISPLAY_FD, TIOCGWINSZ, &term_size)) return false; // get terminal size
 
-	struct pos skew = POS(2, 1);
-
-	const static unsigned scale = 2; // adjust code for producing block character if changing this
-
-	size_t term_size_x = term_size.ws_col,
-	       term_size_y = term_size.ws_row,
-	       size_x = term_size_x * scale,
-	       size_y = term_size_y * scale;
-	struct pos sizef = POS(size_x, size_y);
-
-	size_t buf_size = ((size_x * size_y) + CHAR_BIT - 1) / CHAR_BIT;
-
-#define INDEX(x, y) ((size_t) (y) * (size_t) (size_x) + (size_t) (x))
-#define INDEX_CHAR(x, y) (INDEX(x, y) / CHAR_BIT)
-#define INDEX_BIT(x, y) (1 << (INDEX(x, y) % CHAR_BIT)) // returns bit mask
-
-	char *buf = calloc(1, buf_size);
-
-#define SET_BIT(char, mask, set) (set ? (char) | (mask) : (char) &~(mask))
-#define GET_CELL(x, y) ((buf[INDEX_CHAR(x, y)] & INDEX_BIT(x, y)) != 0)
-#define SET_CELL_NO_CHECK(x, y, set) (buf[INDEX_CHAR(x, y)] = SET_BIT(buf[INDEX_CHAR(x, y)], INDEX_BIT(x, y), set))
-#define SET_CELL(x, y, set) \
-	if ((x) >= 0 && (y) >= 0 && (x) < (size_x) && (y) < (size_y)) SET_CELL_NO_CHECK(x, y, set)
+	if (needs_clear) memset(SCREEN.buf, 0x00, SCREEN.buf_size);
 
 	float total_length = 0;
 	for (size_t i = 0; i < chain->count; ++i) total_length += chain->chain[i].length;
 
-	struct pos pend_t = POS(0, 0);
+	struct rectf
+	        rect_from = RECTF(-total_length, -total_length, total_length * 2, total_length * 2), // max distance the pendulum can reach
+	        rect_stretched = RECTF2(POSF2(0), stretch),
+	        rect_to = get_fit_rectf(rect_stretched.size, RECTF2(POSF2(0), poss2f(SCREEN.size))); // letter-box rect to the display screen size
+
+	struct posf pend_t = POSF(0, 0);
 	float pend_angle = 0;
 	for (size_t i = 0; i < chain->count; ++i) {
 		struct pendulum *p = &chain->chain[i];
-		struct pos pend_f = pend_t;
+		struct posf pend_f = pend_t;
 		pend_angle += p->angle;
 		pend_t.x += cos(pend_angle) * p->length;
 		pend_t.y += sin(pend_angle) * p->length;
 
 		// draw line
-#define CELL_POS(x)                                                                                  \
-	get_fit_pos(/* map from [-total_length, +total_length] to [0, skew] */                           \
-	            pos_mul(pos_mul(pos_add(pos_div(x, POS2(total_length)), POS2(1)), POS2(0.5)), skew), \
-	            skew, sizef) // then letter-box that to the cells size
-		struct pos cell_f = CELL_POS(pend_f),
-		           cell_t = CELL_POS(pend_t),
-		           delta = pos_sub(cell_t, cell_f);
+		struct posf cell_f = map_rectf(pend_f, rect_from, rect_to),
+		            cell_t = map_rectf(pend_t, rect_from, rect_to),
+		            delta = posf_sub(cell_t, cell_f);
 		if (delta.x == 0 && delta.y == 0) break;
 		bool swap = fabsf(delta.y) > fabsf(delta.x);
-		if (swap) {
-#define SWAP(type, a, b) \
-	{                    \
-		type temp = b;   \
-		b = a;           \
-		a = temp;        \
-	}
-#define SWAP_POS(a) SWAP(float, a.x, a.y)
-			SWAP_POS(cell_f);
-			SWAP_POS(cell_t);
-			SWAP_POS(delta);
+		if (swap) { // swap x and y if gradient > 1 (45° from horizontal), otherwise there will be gaps since it loops over x-values
+			SWAP_POSF(cell_f);
+			SWAP_POSF(cell_t);
+			SWAP_POSF(delta);
 		}
-		float slope = delta.y / delta.x;
-		signed sign_x = delta.x < 0 ? -1 : 1;
-		for (signed x = floorf(cell_f.x); sign_x * x <= sign_x * ceilf(cell_t.x); x += sign_x) {
-			signed y = roundf(slope * (x - cell_f.x) + cell_f.y); // y-y1=m*(x-x1)
-			signed px = x;
-			if (swap) SWAP(signed, px, y)
-			SET_CELL(px, y, 1);
+		float gradient = delta.y / delta.x;
+		if (delta.x < 0) SWAP(struct posf, cell_f, cell_t); // swap from/to values to make it easier to loop
+		for (size_t x = floorf(cell_f.x); x <= ceilf(cell_t.x); ++x) {
+			struct poss cell = POSS(x, roundf(gradient * (cell.x - cell_f.x) + cell_f.y)); // y=m*(x-x1)+y1
+			if (swap) SWAP_POSS(cell);
+			SET_CELL(cell, 1, SCREEN);
 		}
 	}
 
-	size_t cursor_x = 0, cursor_y = 0;
+	struct poss cursor = POSS2(0);
 
-	for (size_t term_y = 0; term_y < term_size_y; ++term_y)
-		for (size_t term_x = 0; term_x < term_size_x; ++term_x) {
-			size_t cell_x = (size_t) term_x * scale,
-			       cell_y = (size_t) term_y * scale;
+	struct poss term;
+	for (term.y = 0; term.y < display.term_size.y; ++term.y)
+		for (term.x = 0; term.x < display.term_size.x; ++term.x) {
+			struct poss cell = poss_mul(term, block_size);
 
-			static char *chars[] = {" ", "▖", "▗", "▄", "▘", "▌", "▚", "▙", "▝", "▞", "▐", "▟", "▀", "▛", "▜", "█"};
+			static const char *chars[] = {" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"};
 			unsigned char index = 0;
-			index |= GET_CELL(cell_x + 0, cell_y + 1) ? 1 : 0;
-			index |= GET_CELL(cell_x + 1, cell_y + 1) ? 2 : 0;
-			index |= GET_CELL(cell_x + 0, cell_y + 0) ? 4 : 0;
-			index |= GET_CELL(cell_x + 1, cell_y + 0) ? 8 : 0;
-			if (index == 0) continue;
-			char *c = chars[index];
-			if (term_x != cursor_x || term_y != cursor_y) {
-				eprintf("\x1b[%zu;%zuH", term_y + 1, term_x + 1);
-				cursor_x = term_x, cursor_y = term_y;
+			struct poss block;
+			for (block.y = 0; block.y < block_size.y; ++block.y)
+				for (block.x = 0; block.x < block_size.x; ++block.x)
+					if (GET_CELL(poss_add(cell, block), SCREEN))
+						index |= 1 << (block.y * block_size.x + block.x); // set corresponding bit for the block character
+
+			if (index == 0) {
+				if (SCREEN_OTHER.buf)
+					for (block.y = 0; block.y < block_size.y; ++block.y)
+						for (block.x = 0; block.x < block_size.x; ++block.x)
+							if (GET_CELL(poss_add(cell, block), SCREEN_OTHER))
+								goto draw_char; // override previous character
+				// skip drawing empty space
+				continue;
+			}
+
+		draw_char:
+			const char *c = chars[index];
+			(void) c;
+			if (!poss_eq(term, cursor)) {
+				eprintf("\x1b[%zu;%zuH", term.y + 1, term.x + 1);
+				cursor.x = term.x, cursor.y = term.y;
 			}
 			eprintf("%s", c);
-			++cursor_x;
+			++cursor.x;
 		}
 
-	free(buf);
-	fsync(DISPLAY_FD);
+	if (info) {
+		eprintf("\x1b[H");
+		eprintf("%s", info);
+	}
 
-	return true;
+	res = true;
+fail:
+	fsync(DISPLAY_FD);
+	return res;
 }

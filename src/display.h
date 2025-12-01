@@ -4,5 +4,5 @@
 #include <stdbool.h>
 bool display_enable();
 bool display_disable();
-bool display_render(struct pendulum_chain *chain);
+bool display_render(struct pendulum_chain *chain, const char *info);
 #endif

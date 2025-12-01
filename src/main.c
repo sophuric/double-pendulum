@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #define eprintf(...) fprintf(stderr, __VA_ARGS__)
 
@@ -99,6 +100,9 @@ int main() {
 
 #define WAIT ((nsec_t) SEC * 0.01)
 	nsec_t dest = 0;
+
+	char str[1024] = "";
+
 	for (;;) {
 		nsec_t time = get_time();
 
@@ -109,7 +113,10 @@ int main() {
 			step(&chain);
 			dest += WAIT; // add exactly one second to destination time so we can precisely run code every
 		}
-		if (!display_render(&chain)) {
+		nsec_t last_time = get_time();
+		if (!display_render(&chain, str)) {
+			nsec_t diff_time = get_time() - last_time;
+			snprintf(str, sizeof(str), "Simulation time:%" PRIuMAX "aa", diff_time);
 			if (!stop()) return 3;
 			return 1;
 		}
