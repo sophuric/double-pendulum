@@ -25,7 +25,7 @@
           version = "1.0.0";
           src = ./.;
           buildInputs = buildInputs system;
-          buildPhase = "./build release";
+          buildPhase = "bash ./build release";
           installPhase = ''
             mkdir -p $out/bin
             cp out/dpend $out/bin
