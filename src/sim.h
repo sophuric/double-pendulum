@@ -4,9 +4,8 @@
 #include <stdbool.h>
 
 struct pendulum {
-	float mass, length, angle, angular_velocity;
-	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angular_velocity,
-	        *sym_part_deriv_angular_velocity, *sym_part_deriv_angle;
+	float mass, length, angle, angvel;
+	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angvel, *func_angle, *func_angvel;
 };
 
 struct pendulum_system {

@@ -16,14 +16,7 @@
 
 static bool running = false;
 
-struct pendulum_system pendulum_system = {
-        .count = 2,
-        .gravity = 1,
-        .chain =
-                (struct pendulum[]) {
-                                     {.mass = 1, .length = 1, .angular_velocity = 0, .angle = 0.2},
-                                     {.mass = 1, .length = 1, .angular_velocity = 0, .angle = 1}}
-};
+static struct pendulum_system pendulum_system = {0};
 
 #define ASSERT(func, ...)     \
 	if (!(func)) {            \
@@ -104,6 +97,13 @@ int main(void) {
 		if (signal == SIGKILL || signal == SIGSTOP) continue; // can't handle these
 		sigaction(signal, &sa, NULL);
 	}
+
+	pendulum_system.count = 2,
+	pendulum_system.gravity = 1,
+	pendulum_system.chain = (struct pendulum[]) {
+	        {.mass = 1, .length = 1, .angvel = 0, .angle = 0.2},
+	        {.mass = 1, .length = 1, .angvel = 0, .angle = 1  }
+    };
 
 	if (!start()) return 3;
 
