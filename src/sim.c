@@ -1,4 +1,7 @@
 #include "sim.h"
+#include "rk4.h"
+
+#include <string.h>
 
 static unsigned log10i(size_t x) {
 	unsigned i;
@@ -20,7 +23,7 @@ bool sim_init(struct pendulum_system *system) {
 	// initialise temp variables
 	basic temp, vx, vy, vlx, vly, half, one, t_angvel, t_angle;
 	CVecBasic *time_args = NULL;
-	CMapBasicBasic *to_func_subs = NULL;
+	CMapBasicBasic *to_func_subs = NULL, *to_sym_subs = NULL;
 	basic_new_stack(temp);
 	basic_new_stack(vx);
 	basic_new_stack(vy);
@@ -54,6 +57,9 @@ bool sim_init(struct pendulum_system *system) {
 	to_func_subs = mapbasicbasic_new();
 	if (!to_func_subs) goto fail;
 
+	to_sym_subs = mapbasicbasic_new();
+	if (!to_sym_subs) goto fail;
+
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
 
@@ -64,6 +70,7 @@ bool sim_init(struct pendulum_system *system) {
 		HEAP_ALLOC(p->sym_angvel);
 		HEAP_ALLOC(p->func_angle);
 		HEAP_ALLOC(p->func_angvel);
+		HEAP_ALLOC(p->equation_of_motion);
 
 		// create unique name for the variable
 		unsigned str_size = 16 + log10i(i);
@@ -131,6 +138,9 @@ bool sim_init(struct pendulum_system *system) {
 
 		mapbasicbasic_insert(to_func_subs, p->sym_angle, p->func_angle);
 		mapbasicbasic_insert(to_func_subs, p->sym_angvel, p->func_angvel);
+
+		mapbasicbasic_insert(to_sym_subs, p->func_angle, p->sym_angle);
+		mapbasicbasic_insert(to_sym_subs, p->func_angvel, p->sym_angvel);
 	}
 
 	for (unsigned i = 0; i < system->count; ++i) {
@@ -152,15 +162,12 @@ bool sim_init(struct pendulum_system *system) {
 		// differentiate t_angvel w.r.t. time
 		ASSERT(basic_diff(t_angvel, t_angvel, system->time));
 
-		// TODO
-		char *str;
-		str = basic_str(t_angle);
-		printf("∂L/∂q = %s\n\n", str);
-		basic_str_free(str);
+		// substitute symbols back in
+		basic_subs(t_angle, t_angle, to_sym_subs);
+		basic_subs(t_angvel, t_angvel, to_sym_subs);
 
-		str = basic_str(t_angvel);
-		printf("d/dt (∂L/∂q̇) = %s\n\n", str);
-		basic_str_free(str);
+		// final equation
+		ASSERT(basic_sub(p->equation_of_motion, t_angle, t_angvel));
 	}
 
 	ret = true;
@@ -178,6 +185,7 @@ fail:
 
 	vecbasic_free(time_args);
 	mapbasicbasic_free(to_func_subs);
+	mapbasicbasic_free(to_sym_subs);
 
 	if (!ret) {
 		if (res) fprintf(stderr, "SymEngine exception %d\n", res);
@@ -201,15 +209,109 @@ bool sim_free(struct pendulum_system *system) {
 		HEAP_FREE(p->sym_angvel);
 		HEAP_FREE(p->func_angle);
 		HEAP_FREE(p->func_angvel);
+		HEAP_FREE(p->equation_of_motion);
 	}
 	return true;
 }
 
+static CWRAPPER_OUTPUT_TYPE basic_substitute(basic out, basic in, struct pendulum_system *system) {
+	CWRAPPER_OUTPUT_TYPE res = 0;
+
+	basic sym_number;
+	basic_new_stack(sym_number);
+
+	ASSERT(basic_assign(out, in));
+
+#define SUBS(symbol, number)                       \
+	ASSERT(real_double_set_d(sym_number, number)); \
+	ASSERT(basic_subs2(out, out, symbol, sym_number));
+
+	// substitute in real numbers
+	SUBS(system->sym_gravity, system->gravity);
+	for (int j = 0; j < system->count; ++j) {
+		struct pendulum *pend = &system->chain[j];
+		SUBS(pend->sym_mass, pend->mass);
+		SUBS(pend->sym_length, pend->length);
+		SUBS(pend->sym_angle, pend->angle);
+		SUBS(pend->sym_angvel, pend->angvel);
+	}
+
+#undef SUBS
+fail:
+	basic_free_stack(sym_number);
+	return res;
+}
+
+bool sim_substitute(double *out, basic in, struct pendulum_system *system) {
+	basic sym_out;
+	basic_new_stack(sym_out);
+	if (basic_substitute(sym_out, in, system)) {
+		basic_free_stack(sym_out);
+		return false;
+	}
+
+	*out = real_double_get_d(sym_out);
+	basic_free_stack(sym_out);
+	return true;
+}
+
+static const int steps = 10;
+static const int var_per_pendulum = 2;
+static struct pendulum_system *current_system;
+static bool dydt_success;
+
+static void dydt(double t, double y[], double out[]) {
+	// set all zeros beforehand
+	for (int i = 0; i < current_system->count; ++i) out[i * 2] = 0, out[i * 2 + 1] = 0;
+
+	for (int i = 0; i < current_system->count; ++i) {
+		struct pendulum *pend = &current_system->chain[i];
+
+		for (int j = 0; j < current_system->count; ++j) {
+			struct pendulum *pend2 = &current_system->chain[j];
+			// using values from the solver
+			pend2->angle = y[j * 2];
+			pend2->angvel = y[j * 2 + 1];
+		}
+
+		double number;
+		if (!sim_substitute(&number, pend->equation_of_motion, current_system)) goto fail;
+
+		// eq should now be evaluated to a number
+		out[i * 2 + 1] = number;
+		out[i * 2] = y[i * 2 + 1];
+	}
+
+	dydt_success = true;
+fail:
+}
+
 bool sim_step(struct pendulum_system *system) {
+	current_system = system;
+	int variables = system->count * var_per_pendulum;
+	double tspan[2] = {0, 0.01};
+	double y[variables * (steps + 1)];
+	double t[steps + 1];
+
+	// copy pendulum data into input
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
-		// testing
-		p->angle += 0.05 * (i + 1);
+		y[i * var_per_pendulum] = p->angle;
+		y[i * var_per_pendulum + 1] = p->angvel;
 	}
+
+	// perform Runge-Kutta order 4
+	dydt_success = false;
+	rk4(dydt, tspan, y, steps, variables, t, y);
+	if (!dydt_success) return false;
+
+	// copy output back into pendulum data
+	double *final_y = &y[variables * steps];
+	for (unsigned i = 0; i < system->count; ++i) {
+		struct pendulum *p = &system->chain[i];
+		p->angle = final_y[i * var_per_pendulum];
+		p->angvel = final_y[i * var_per_pendulum + 1];
+	}
+
 	return true;
 }

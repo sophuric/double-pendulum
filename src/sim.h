@@ -4,17 +4,21 @@
 #include <stdbool.h>
 
 struct pendulum {
-	float mass, length, angle, angvel;
-	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angvel, *func_angle, *func_angvel;
+	double mass, length, angle, angvel;
+	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angvel,
+	        *equation_of_motion,
+	        *func_angle, *func_angvel;
 };
 
 struct pendulum_system {
-	float gravity;
-	basic_struct *sym_gravity, *time, *ke, *gpe, *lagrangian;
+	double gravity;
+	basic_struct *sym_gravity,
+	        *time, *ke, *gpe, *lagrangian;
 	unsigned count;
 	struct pendulum *chain;
 };
 
+bool sim_substitute(double *out, basic in, struct pendulum_system *system);
 bool sim_init(struct pendulum_system *system);
 bool sim_step(struct pendulum_system *system);
 bool sim_free(struct pendulum_system *system);

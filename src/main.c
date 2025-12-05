@@ -8,6 +8,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <math.h>
 
 #define eprintf(...) fprintf(stderr, __VA_ARGS__)
 
@@ -99,10 +100,10 @@ int main(void) {
 	}
 
 	pendulum_system.count = 2,
-	pendulum_system.gravity = 1,
+	pendulum_system.gravity = 9.81,
 	pendulum_system.chain = (struct pendulum[]) {
-	        {.mass = 1, .length = 1, .angvel = 0, .angle = 0.2},
-	        {.mass = 1, .length = 1, .angvel = 0, .angle = 1  }
+	        {.mass = 1, .length = 1, .angvel = 0, .angle = M_PI + 0.1},
+	        {.mass = 1, .length = 1, .angvel = 0, .angle = 0.2       }
     };
 
 	if (!start()) return 3;
@@ -121,8 +122,20 @@ int main(void) {
 		if (dest == time + WAIT || nsleep(delay)) {
 			time = get_time();
 			if (!sim_step(&pendulum_system)) goto fail;
+
+			double ke, gpe, total;
+			if (!sim_substitute(&ke, pendulum_system.ke, &pendulum_system)) goto fail;
+			if (!sim_substitute(&gpe, pendulum_system.gpe, &pendulum_system)) goto fail;
+			total = ke + gpe;
+
 			nsec_t diff_time = get_time() - time;
-			int printf_res = snprintf(str, sizeof(str), "Simulation time: %6" PRIuMAX "ns", diff_time);
+			int printf_res = snprintf(str, sizeof(str),
+			                          " Simulation time: %10" PRIuMAX " ns\n"
+			                          "  Kinetic energy: %10.3f J\n"
+			                          "Potential energy: %10.3f J\n"
+			                          "    Total energy: %10.3f J\n",
+			                          diff_time, ke, gpe, total);
+
 			if (printf_res < 0 || printf_res >= sizeof(str)) goto fail;
 			dest += WAIT; // add delay amount to destination time so we can precisely run the code on that interval
 		}
