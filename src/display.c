@@ -122,10 +122,10 @@ bool display_render(struct pendulum_system *system, const char *info) {
 		SCREEN.buf = buf;
 	}
 
-	if (buf_size != SCREEN.buf_size) eprintf("\x1b[2J"); // clear on resize
+	bool resize = false;
+	if (buf_size != SCREEN.buf_size) resize = true;
 
 	SCREEN.buf_size = buf_size;
-
 
 	if (needs_clear) memset(SCREEN.buf, 0x00, SCREEN.buf_size);
 
@@ -164,6 +164,7 @@ bool display_render(struct pendulum_system *system, const char *info) {
 		}
 	}
 
+	if (resize) eprintf("\x1b[2J"); // clear on resize
 	if (info) {
 		eprintf("\x1b[H");
 		const char *newline;
