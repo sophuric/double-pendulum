@@ -1,8 +1,6 @@
 #include "sim.h"
 #include "rk4.h"
 
-#include <string.h>
-
 static unsigned log10i(size_t x) {
 	unsigned i;
 	for (i = 1; x >= 10; x /= 10) ++i;
@@ -22,7 +20,8 @@ bool sim_init(struct pendulum_system *system) {
 
 	// initialise temp variables
 	basic temp, vx, vy, vlx, vly, half, one, t_angvel, t_angle;
-	CVecBasic *time_args = NULL;
+	CVecBasic *time_args = NULL,
+	          *acc_system = NULL, *acc_solution = NULL, *acc_symbol = NULL;
 	CMapBasicBasic *to_func_subs = NULL, *to_sym_subs = NULL;
 	basic_new_stack(temp);
 	basic_new_stack(vx);
@@ -54,6 +53,13 @@ bool sim_init(struct pendulum_system *system) {
 	if (!time_args) goto fail;
 	vecbasic_push_back(time_args, system->time);
 
+	acc_system = vecbasic_new();
+	if (!acc_system) goto fail;
+	acc_solution = vecbasic_new();
+	if (!acc_solution) goto fail;
+	acc_symbol = vecbasic_new();
+	if (!acc_symbol) goto fail;
+
 	to_func_subs = mapbasicbasic_new();
 	if (!to_func_subs) goto fail;
 
@@ -68,9 +74,12 @@ bool sim_init(struct pendulum_system *system) {
 		HEAP_ALLOC(p->sym_length);
 		HEAP_ALLOC(p->sym_angle);
 		HEAP_ALLOC(p->sym_angvel);
+		HEAP_ALLOC(p->sym_angacc);
 		HEAP_ALLOC(p->func_angle);
 		HEAP_ALLOC(p->func_angvel);
+		HEAP_ALLOC(p->func_angacc);
 		HEAP_ALLOC(p->equation_of_motion);
+		HEAP_ALLOC(p->solution_angacc);
 
 		// create unique name for the variable
 		unsigned str_size = 16 + log10i(i);
@@ -87,11 +96,14 @@ bool sim_init(struct pendulum_system *system) {
 		ASSERT(symbol_set(p->sym_angle, str));
 		str[0] = 'v';
 		ASSERT(symbol_set(p->sym_angvel, str));
+		str[0] = 'a';
+		ASSERT(symbol_set(p->sym_angacc, str));
 
 		// define angle and angular velocity functions
 		str[0] = 'f';
 		ASSERT(function_symbol_set(p->func_angle, str, time_args));
 		ASSERT(basic_diff(p->func_angvel, p->func_angle, system->time));
+		ASSERT(basic_diff(p->func_angacc, p->func_angvel, system->time));
 
 		// define the kinetic energy
 
@@ -136,17 +148,22 @@ bool sim_init(struct pendulum_system *system) {
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
 
-		mapbasicbasic_insert(to_func_subs, p->sym_angle, p->func_angle);
+		mapbasicbasic_insert(to_func_subs, p->sym_angacc, p->func_angacc);
 		mapbasicbasic_insert(to_func_subs, p->sym_angvel, p->func_angvel);
+		mapbasicbasic_insert(to_func_subs, p->sym_angle, p->func_angle);
 
-		mapbasicbasic_insert(to_sym_subs, p->func_angle, p->sym_angle);
+		mapbasicbasic_insert(to_sym_subs, p->func_angacc, p->sym_angacc);
 		mapbasicbasic_insert(to_sym_subs, p->func_angvel, p->sym_angvel);
+		mapbasicbasic_insert(to_sym_subs, p->func_angle, p->sym_angle);
 	}
 
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
 
+		// https://en.wikipedia.org/wiki/Lagrangian_mechanics#Equations_of_motion
+
 		// partially differentiate Lagrangian function
+		// these are taken separately for each axis
 		ASSERT(basic_diff(t_angle, system->lagrangian, p->sym_angle));
 		// note that angular velocity is treated as a separate variable to angle when finding this partial derivative,
 		// instead of as the derivative of the angle w.r.t. time
@@ -155,19 +172,29 @@ bool sim_init(struct pendulum_system *system) {
 
 		// implement Lagrange's equations
 
-		// convert angle and angular velocity into functions of time, so SymEngine doesn't think they're constants and differentiates them to zero
-		basic_subs(t_angle, t_angle, to_func_subs);
+		// convert into a function of time, so SymEngine doesn't think angle and angular velocity are constants and differentiates them to zero
 		basic_subs(t_angvel, t_angvel, to_func_subs);
 
 		// differentiate t_angvel w.r.t. time
 		ASSERT(basic_diff(t_angvel, t_angvel, system->time));
 
 		// substitute symbols back in
-		basic_subs(t_angle, t_angle, to_sym_subs);
 		basic_subs(t_angvel, t_angvel, to_sym_subs);
 
 		// final equation
-		ASSERT(basic_sub(p->equation_of_motion, t_angle, t_angvel));
+		ASSERT(basic_sub(p->equation_of_motion, t_angvel, t_angle));
+
+		// add equation in system of equations to solve for angular acceleration
+		vecbasic_push_back(acc_system, p->equation_of_motion);
+		vecbasic_push_back(acc_symbol, p->sym_angacc);
+	}
+
+	// solve system of equations for angular acceleration
+	ASSERT(vecbasic_linsolve(acc_solution, acc_system, acc_symbol));
+
+	// assign solutions for each angular acceleration
+	for (unsigned i = 0; i < system->count; ++i) {
+		ASSERT(vecbasic_get(acc_solution, i, system->chain[i].solution_angacc));
 	}
 
 	ret = true;
@@ -184,6 +211,9 @@ fail:
 	basic_free_stack(t_angle);
 
 	vecbasic_free(time_args);
+	vecbasic_free(acc_system);
+	vecbasic_free(acc_solution);
+
 	mapbasicbasic_free(to_func_subs);
 	mapbasicbasic_free(to_sym_subs);
 
@@ -207,9 +237,12 @@ bool sim_free(struct pendulum_system *system) {
 		HEAP_FREE(p->sym_length);
 		HEAP_FREE(p->sym_angle);
 		HEAP_FREE(p->sym_angvel);
+		HEAP_FREE(p->sym_angacc);
 		HEAP_FREE(p->func_angle);
 		HEAP_FREE(p->func_angvel);
+		HEAP_FREE(p->func_angacc);
 		HEAP_FREE(p->equation_of_motion);
+		HEAP_FREE(p->solution_angacc);
 	}
 	return true;
 }
@@ -237,6 +270,7 @@ static CWRAPPER_OUTPUT_TYPE basic_substitute(basic out, basic in, struct pendulu
 	}
 
 #undef SUBS
+
 fail:
 	basic_free_stack(sym_number);
 	return res;
@@ -262,7 +296,7 @@ static bool dydt_success;
 
 static void dydt(double t, double y[], double out[]) {
 	// set all zeros beforehand
-	for (int i = 0; i < current_system->count; ++i) out[i * 2] = 0, out[i * 2 + 1] = 0;
+	for (int i = 0; i < current_system->count; ++i) out[i * var_per_pendulum] = 0, out[i * var_per_pendulum + 1] = 0;
 
 	for (int i = 0; i < current_system->count; ++i) {
 		struct pendulum *pend = &current_system->chain[i];
@@ -270,16 +304,16 @@ static void dydt(double t, double y[], double out[]) {
 		for (int j = 0; j < current_system->count; ++j) {
 			struct pendulum *pend2 = &current_system->chain[j];
 			// using values from the solver
-			pend2->angle = y[j * 2];
-			pend2->angvel = y[j * 2 + 1];
+			pend2->angle = y[j * var_per_pendulum];
+			pend2->angvel = y[j * var_per_pendulum + 1];
 		}
 
 		double number;
-		if (!sim_substitute(&number, pend->equation_of_motion, current_system)) goto fail;
+		if (!sim_substitute(&number, pend->solution_angacc, current_system)) goto fail;
 
 		// eq should now be evaluated to a number
-		out[i * 2 + 1] = number;
-		out[i * 2] = y[i * 2 + 1];
+		out[i * var_per_pendulum] = y[i * var_per_pendulum + 1]; // angle changes by angvel
+		out[i * var_per_pendulum + 1] = number;                  // angvel changes by the number
 	}
 
 	dydt_success = true;

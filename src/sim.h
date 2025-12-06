@@ -5,9 +5,9 @@
 
 struct pendulum {
 	double mass, length, angle, angvel;
-	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angvel,
+	basic_struct *sym_mass, *sym_length, *sym_angle, *sym_angvel, *sym_angacc, *solution_angacc,
 	        *equation_of_motion,
-	        *func_angle, *func_angvel;
+	        *func_angle, *func_angvel, *func_angacc;
 };
 
 struct pendulum_system {
