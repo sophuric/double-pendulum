@@ -2,6 +2,7 @@
 #define SIMULATION_SPEED 1
 #define STEPS_PER_FRAME 1
 #define FRAME_SKIP true // frame skipping is non-deterministic
+#define DEBUG false // disable tcsetattr and terminal ANSI codes when entering/exiting display mode
 #define CONFIGURE(system)                                                   \
 	system.gravity = 9.81;                                                  \
 	system.count = 2;                                                       \

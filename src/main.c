@@ -32,7 +32,7 @@ static bool stop(void) {
 	running = false;
 
 	bool res = true;
-	ASSERT(display_disable(), "Failed to deinitialise display\n");
+	ASSERT(display_disable(DEBUG), "Failed to deinitialise display\n");
 	ASSERT(sim_free(&pendulum_system), "Failed to deinitialise simulation\n");
 
 	return res;
@@ -44,7 +44,7 @@ static bool start(void) {
 
 	bool res = true;
 	ASSERT(sim_init(&pendulum_system), "Failed to initialise simulation\n");
-	ASSERT(display_enable(), "Failed to initialise display\n");
+	ASSERT(display_enable(DEBUG), "Failed to initialise display\n");
 
 	if (!res) stop();
 	return res;

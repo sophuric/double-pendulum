@@ -49,18 +49,20 @@ static struct display_data {
 #define SCREEN (display.screen[display.screen_index])
 #define SCREEN_OTHER (display.screen[display.screen_index ^ 1])
 
-bool display_enable() {
+bool display_enable(bool debug) {
 	if (tcgetattr(DISPLAY_FD, &display.old_termios)) return false;
 
-	struct termios new_termios = display.old_termios;
-	cfmakeraw(&new_termios);     // stty raw
-	new_termios.c_lflag |= ISIG; // allow ^C = SIGINT, etc.
+	if (!debug) {
+		struct termios new_termios = display.old_termios;
+		cfmakeraw(&new_termios);     // stty raw
+		new_termios.c_lflag |= ISIG; // allow ^C = SIGINT, etc.
 
-	if (tcsetattr(DISPLAY_FD, TCSANOW, &new_termios)) return false;
+		if (tcsetattr(DISPLAY_FD, TCSANOW, &new_termios)) return false;
 
-	eprintf("\x1b[?1049h"); // move to separate buffer
-	eprintf("\x1b[?7l");    // disable newline at end of line
-	eprintf("\x1b[?25l");   // hide cursor
+		eprintf("\x1b[?1049h"); // move to separate buffer
+		eprintf("\x1b[?7l");    // disable newline at end of line
+		eprintf("\x1b[?25l");   // hide cursor
+	}
 
 	display.screen[0].buf = NULL;
 	display.screen[1].buf = NULL;
@@ -70,15 +72,18 @@ fail:
 	return false;
 }
 
-bool display_disable() {
+bool display_disable(bool debug) {
 	FREE(display.screen[0].buf);
 	FREE(display.screen[1].buf);
-	eprintf("\x1b[H");                                                      // move to start
-	eprintf("\x1b[2J");                                                     // clear
-	eprintf("\x1b[?25h");                                                   // show cursor
-	eprintf("\x1b[?7h");                                                    // re-enable newline at end of line
-	eprintf("\x1b[?1049l");                                                 // restore buffer
-	if (tcsetattr(DISPLAY_FD, TCSANOW, &display.old_termios)) return false; // restore terminal settings
+
+	if (!debug) {
+		eprintf("\x1b[H");                                                      // move to start
+		eprintf("\x1b[2J");                                                     // clear
+		eprintf("\x1b[?25h");                                                   // show cursor
+		eprintf("\x1b[?7h");                                                    // re-enable newline at end of line
+		eprintf("\x1b[?1049l");                                                 // restore buffer
+		if (tcsetattr(DISPLAY_FD, TCSANOW, &display.old_termios)) return false; // restore terminal settings
+	}
 	return true;
 fail:
 	return false;
