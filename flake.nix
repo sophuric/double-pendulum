@@ -19,7 +19,7 @@
         };
       });
       packages = forAllSystems (system: rec {
-        default = dpend;
+        default = self.packages.${system}.dpend;
         dpend = nixpkgs.legacyPackages.${system}.stdenv.mkDerivation {
           name = "dpend";
           version = "1.0.0";
