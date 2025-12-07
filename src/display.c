@@ -49,19 +49,21 @@ static struct display_data {
 #define SCREEN (display.screen[display.screen_index])
 #define SCREEN_OTHER (display.screen[display.screen_index ^ 1])
 
-bool display_enable(bool debug) {
+bool display_enable(struct display_params params) {
 	if (tcgetattr(DISPLAY_FD, &display.old_termios)) return false;
 
-	if (!debug) {
+	if (!params.debug) {
 		struct termios new_termios = display.old_termios;
 		cfmakeraw(&new_termios);     // stty raw
 		new_termios.c_lflag |= ISIG; // allow ^C = SIGINT, etc.
 
 		if (tcsetattr(DISPLAY_FD, TCSANOW, &new_termios)) return false;
 
-		eprintf("\x1b[?1049h"); // move to separate buffer
-		eprintf("\x1b[?7l");    // disable newline at end of line
-		eprintf("\x1b[?25l");   // hide cursor
+		eprintf(
+		        "\x1b[?1049h" // move to separate buffer
+		        "\x1b[?7l"    // disable newline at end of line
+		        "\x1b[?25l"   // hide cursor
+		);
 	}
 
 	display.screen[0].buf = NULL;
@@ -72,16 +74,19 @@ fail:
 	return false;
 }
 
-bool display_disable(bool debug) {
+bool display_disable(struct display_params params) {
 	FREE(display.screen[0].buf);
 	FREE(display.screen[1].buf);
 
-	if (!debug) {
-		eprintf("\x1b[H");                                                      // move to start
-		eprintf("\x1b[2J");                                                     // clear
-		eprintf("\x1b[?25h");                                                   // show cursor
-		eprintf("\x1b[?7h");                                                    // re-enable newline at end of line
-		eprintf("\x1b[?1049l");                                                 // restore buffer
+	if (!params.debug) {
+		eprintf(
+		        "\x1b[H"      // move to start
+		        "\x1b[2J"     // clear
+		        "\x1b[?25h"   // show cursor
+		        "\x1b[?7h"    // re-enable newline at end of line
+		        "\x1b[?1049l" // restore buffer
+		);
+
 		if (tcsetattr(DISPLAY_FD, TCSANOW, &display.old_termios)) return false; // restore terminal settings
 	}
 	return true;
@@ -89,7 +94,25 @@ fail:
 	return false;
 }
 
-bool display_render(struct pendulum_system *system, const char *info) {
+static void draw_line(struct posf pos1, struct posf pos2, bool set, struct display_screen screen) {
+	struct posf delta = posf_sub(pos1, pos2);
+
+	bool swap = fabsf(delta.y) > fabsf(delta.x);
+	if (swap) { // swap x and y if gradient > 1 (45° from horizontal), otherwise there will be gaps since it loops over x-values
+		SWAP_POSF(pos2);
+		SWAP_POSF(pos1);
+		SWAP_POSF(delta);
+	}
+	float gradient = delta.x != 0 ? delta.y / delta.x : 0;
+	if (delta.x < 0) SWAP(struct posf, pos2, pos1); // swap from/to values to make it easier to loop
+	for (size_t x = floorf(pos2.x); x <= ceilf(pos1.x); ++x) {
+		struct poss cell = POSS(x, roundf(gradient * (cell.x - pos2.x) + pos2.y)); // y=m*(x-x1)+y1
+		if (swap) SWAP_POSS(cell);
+		SET_CELL(cell, set, screen);
+	}
+}
+
+bool display_render(struct display_params params, struct pendulum_system *system) {
 	bool res = false;
 
 	eprintf("\x1b[H"); // move to start
@@ -146,27 +169,15 @@ bool display_render(struct pendulum_system *system, const char *info) {
 
 		// draw line
 		struct posf cell_f = map_rectf(pend_f, rect_from, rect_to),
-		            cell_t = map_rectf(pend_t, rect_from, rect_to),
-		            delta = posf_sub(cell_t, cell_f);
-		if (delta.x == 0 && delta.y == 0) break;
-		bool swap = fabsf(delta.y) > fabsf(delta.x);
-		if (swap) { // swap x and y if gradient > 1 (45° from horizontal), otherwise there will be gaps since it loops over x-values
-			SWAP_POSF(cell_f);
-			SWAP_POSF(cell_t);
-			SWAP_POSF(delta);
-		}
-		float gradient = delta.y / delta.x;
-		if (delta.x < 0) SWAP(struct posf, cell_f, cell_t); // swap from/to values to make it easier to loop
-		for (size_t x = floorf(cell_f.x); x <= ceilf(cell_t.x); ++x) {
-			struct poss cell = POSS(x, roundf(gradient * (cell.x - cell_f.x) + cell_f.y)); // y=m*(x-x1)+y1
-			if (swap) SWAP_POSS(cell);
-			SET_CELL(cell, 1, SCREEN);
-		}
+		            cell_t = map_rectf(pend_t, rect_from, rect_to);
+
+		draw_line(cell_f, cell_t, 1, SCREEN);
 	}
 
 	if (resize) eprintf("\x1b[2J"); // clear on resize
-	if (info) {
+	if (params.info) {
 		eprintf("\x1b[H");
+		const char *info = params.info;
 		const char *newline;
 		do {
 			newline = strchr(info, '\n');
@@ -179,6 +190,7 @@ bool display_render(struct pendulum_system *system, const char *info) {
 	}
 
 	struct poss cursor = POSS2(0);
+	bool cursor_moved = false;
 
 	struct poss term;
 	for (term.y = 0; term.y < display.term_size.y; ++term.y)
@@ -206,11 +218,12 @@ bool display_render(struct pendulum_system *system, const char *info) {
 		draw_char:
 			const char *c = chars[index];
 			(void) c;
-			if (!poss_eq(term, cursor)) {
-				eprintf("\x1b[%zu;%zuH", term.y + 1, term.x + 1);
-				cursor.x = term.x, cursor.y = term.y;
-			}
-			eprintf("%s", c);
+			if (!poss_eq(term, cursor) || !cursor_moved) {
+				eprintf("\x1b[%zu;%zuH%s", term.y + 1, term.x + 1, c);
+				cursor = term;
+				cursor_moved = true;
+			} else
+				eprintf("%s", c);
 			++cursor.x;
 		}
 

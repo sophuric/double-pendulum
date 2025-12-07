@@ -14,12 +14,11 @@
 
 #include "display.h"
 #include "sim.h"
+#include "util.h"
 
 #include "config.h"
 
 static bool running = false;
-
-static struct pendulum_system pendulum_system = {0};
 
 #define ASSERT(func, ...)     \
 	if (!(func)) {            \
@@ -27,26 +26,31 @@ static struct pendulum_system pendulum_system = {0};
 		res = false;          \
 	}
 
-static bool stop(void) {
+static char *info_str = NULL;
+
+static bool stop(bool final) {
 	if (!running) return true;
 	running = false;
 
 	bool res = true;
-	ASSERT(display_disable(DEBUG), "Failed to deinitialise display\n");
+	ASSERT(display_disable(display_params), "Failed to deinitialise display\n");
 	ASSERT(sim_free(&pendulum_system), "Failed to deinitialise simulation\n");
+
+	if (final) FREE(info_str);
+	display_params.info = NULL;
 
 	return res;
 }
 
-static bool start(void) {
+static bool start(bool first) {
 	if (running) return true;
 	running = true;
 
 	bool res = true;
 	ASSERT(sim_init(&pendulum_system), "Failed to initialise simulation\n");
-	ASSERT(display_enable(DEBUG), "Failed to initialise display\n");
+	ASSERT(display_enable(display_params), "Failed to initialise display\n");
 
-	if (!res) stop();
+	if (!res) stop(true);
 	return res;
 }
 #undef ASSERT
@@ -57,19 +61,24 @@ static void signal_func(int signal) {
 	}
 
 	if (signal == SIGCONT) {
-		if (!start()) exit(3);
+		if (!start(false)) exit(3);
 		return;
 	}
 
-	bool did_stop = stop();
-	eprintf("Caught signal %02i: %s\n", signal, strsignal(signal));
-	if (!did_stop) exit(3);
+	bool is_stop_signal = false;
 	switch (signal) {
 		case SIGTSTP:
 		case SIGTTIN:
 		case SIGTTOU:
-			raise(SIGSTOP);
-			return;
+			is_stop_signal = true;
+	}
+
+	bool did_stop = stop(!is_stop_signal);
+	eprintf("Caught signal %02i: %s\n", signal, strsignal(signal));
+	if (!did_stop) exit(3);
+	if (is_stop_signal) {
+		raise(SIGSTOP);
+		return;
 	}
 	exit(signal == SIGINT ? 0 : 1);
 }
@@ -101,11 +110,15 @@ int main(void) {
 		sigaction(signal, &sa, NULL);
 	}
 
-	CONFIGURE(pendulum_system);
+	if (!start(true)) return 3;
 
-	if (!start()) return 3;
+	const static size_t info_str_size = 1024;
 
-	char str[1024] = "";
+	if (SHOW_INFO) {
+		info_str = malloc(info_str_size);
+		if (!info_str) goto fail;
+	}
+	display_params.info = info_str;
 
 	const nsec_t wait_time = SEC / (MAX_FPS);
 	nsec_t dest = get_time(), dest_last = dest;
@@ -139,29 +152,31 @@ int main(void) {
 			if (!sim_substitute(&gpe, pendulum_system.gpe, &pendulum_system)) goto fail;
 			total = ke + gpe;
 
-			nsec_t sim_time = get_time() - time;
-			int printf_res = snprintf(str, sizeof(str),
-			                          "             FPS: %10.3f Hz%s%s%s\n"
-			                          " Simulation time: %10" PRIuMAX " ns\n"
-			                          "  Kinetic energy: %10.3f J\n"
-			                          "Potential energy: %10.3f J\n"
-			                          "    Total energy: %10.3f J\n",
-			                          SEC / (double) frame_time,
-			                          show_lag ? " (" : "",
-			                          show_lag ? (frame_skip ? "frame skipping" : "lagging") : "",
-			                          show_lag ? ")" : "",
-			                          sim_time, ke, gpe, total);
+			if (info_str) {
+				nsec_t sim_time = get_time() - time;
+				int printf_res = snprintf(info_str, info_str_size,
+				                          "             FPS: %10.3f Hz%s%s%s\n"
+				                          " Simulation time: %10" PRIuMAX " ns\n"
+				                          "  Kinetic energy: %10.3f J\n"
+				                          "Potential energy: %10.3f J\n"
+				                          "    Total energy: %10.3f J\n",
+				                          SEC / (double) frame_time,
+				                          show_lag ? " (" : "",
+				                          show_lag ? (frame_skip ? "frame skipping" : "lagging") : "",
+				                          show_lag ? ")" : "",
+				                          sim_time, ke, gpe, total);
+				if (printf_res < 0 || printf_res >= info_str_size) goto fail;
+			}
 
-			if (printf_res < 0 || printf_res >= sizeof(str)) goto fail;
 			dest_last = dest;
 			dest += wait_time; // add delay amount to destination time so we can precisely run the code on that interval
 			first = false;
 		}
-		if (!display_render(&pendulum_system, str)) goto fail;
+		if (!display_render(display_params, &pendulum_system)) goto fail;
 	}
 
 	return 0;
 fail:
-	if (!stop()) return 3;
+	if (!stop(true)) return 3;
 	return 1;
 }

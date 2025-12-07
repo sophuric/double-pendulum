@@ -2,7 +2,12 @@
 #define DISPLAY_H
 #include "sim.h"
 #include <stdbool.h>
-bool display_enable(bool debug);
-bool display_disable(bool debug);
-bool display_render(struct pendulum_system *system, const char *info);
+struct display_params {
+	const char *info;
+	bool debug;
+};
+
+bool display_enable(struct display_params params);
+bool display_disable(struct display_params params);
+bool display_render(struct display_params params, struct pendulum_system *system);
 #endif
