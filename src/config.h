@@ -4,7 +4,7 @@
 #define FRAME_SKIP true // frame skipping is non-deterministic
 #define SHOW_INFO true
 
-static struct display_params display_params = {
+static struct display_data display = {
         .debug = false, // disable tcsetattr and terminal ANSI codes when entering/exiting display mode
 };
 static struct pendulum_system pendulum_system = {

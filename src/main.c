@@ -33,11 +33,11 @@ static bool stop(bool final) {
 	running = false;
 
 	bool res = true;
-	ASSERT(display_disable(display_params), "Failed to deinitialise display\n");
+	ASSERT(display_disable(&display), "Failed to deinitialise display\n");
 	ASSERT(sim_free(&pendulum_system), "Failed to deinitialise simulation\n");
 
 	if (final) FREE(info_str);
-	display_params.info = NULL;
+	display.info = NULL;
 
 	return res;
 }
@@ -48,7 +48,7 @@ static bool start(bool first) {
 
 	bool res = true;
 	ASSERT(sim_init(&pendulum_system), "Failed to initialise simulation\n");
-	ASSERT(display_enable(display_params), "Failed to initialise display\n");
+	ASSERT(display_enable(&display), "Failed to initialise display\n");
 
 	if (!res) stop(true);
 	return res;
@@ -118,7 +118,7 @@ int main(void) {
 		info_str = malloc(info_str_size);
 		if (!info_str) goto fail;
 	}
-	display_params.info = info_str;
+	display.info = info_str;
 
 	const nsec_t wait_time = SEC / (MAX_FPS);
 	nsec_t dest = get_time(), dest_last = dest;
@@ -172,7 +172,7 @@ int main(void) {
 			first = false;
 		}
 		render_time = get_time();
-		if (!display_render(display_params, &pendulum_system)) goto fail;
+		if (!display_render(&display, &pendulum_system)) goto fail;
 		render_time = get_time() - render_time;
 	}
 

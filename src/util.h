@@ -15,6 +15,8 @@ struct poss {
 #define POSS(x_, y_) ((struct poss) {.x = x_, .y = y_})
 #define POSS2(x_) POSS(x_, x_)
 
+#define LENGTHOF(x) (sizeof(x) / sizeof(*(x)))
+
 struct posf posf_add(struct posf a, struct posf b);
 struct posf posf_sub(struct posf a, struct posf b);
 struct posf posf_mul(struct posf a, struct posf b);
