@@ -124,7 +124,7 @@ int main(void) {
 	nsec_t dest = get_time(), dest_last = dest;
 	bool frame_skip = FRAME_SKIP;
 	bool lag = false, first = true;
-	nsec_t last_lag = 0;
+	nsec_t last_lag = 0, render_time = 0;
 
 	while (1) {
 		nsec_t time = get_time();
@@ -154,6 +154,7 @@ int main(void) {
 				int printf_res = snprintf(info_str, info_str_size,
 				                          "             FPS: %10.3f Hz%s%s%s\n"
 				                          " Simulation time: %10" PRIuMAX " ns\n"
+				                          "     Render time: %10" PRIuMAX " ns\n"
 				                          "  Kinetic energy: %10.3f J\n"
 				                          "Potential energy: %10.3f J\n"
 				                          "    Total energy: %10.3f J\n",
@@ -161,7 +162,8 @@ int main(void) {
 				                          show_lag ? " (" : "",
 				                          show_lag ? (frame_skip ? "frame skipping" : "lagging") : "",
 				                          show_lag ? ")" : "",
-				                          sim_time, energy.ke, energy.gpe, energy.ke + energy.gpe);
+				                          sim_time, render_time,
+				                          energy.ke, energy.gpe, energy.ke + energy.gpe);
 				if (printf_res < 0 || printf_res >= info_str_size) goto fail;
 			}
 
@@ -169,7 +171,9 @@ int main(void) {
 			dest += wait_time; // add delay amount to destination time so we can precisely run the code on that interval
 			first = false;
 		}
+		render_time = get_time();
 		if (!display_render(display_params, &pendulum_system)) goto fail;
+		render_time = get_time() - render_time;
 	}
 
 	return 0;
