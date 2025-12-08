@@ -8,7 +8,11 @@
       forAllSystems = nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
       buildInputs = system:
         with nixpkgs.legacyPackages.${system}; [
-          symengine
+          (symengine.overrideAttrs (prev: {
+            buildInputs = prev.buildInputs ++ [ libllvm ];
+            cmakeFlags = prev.cmakeFlags
+              ++ [ (lib.cmakeBool "WITH_LLVM" true) ];
+          }))
           gmp
           mpfr
         ];

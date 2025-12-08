@@ -147,10 +147,7 @@ int main(void) {
 			}
 			bool show_lag = lag && time < last_lag + SEC;
 
-			double ke, gpe, total;
-			if (!sim_substitute(&ke, pendulum_system.ke, &pendulum_system)) goto fail;
-			if (!sim_substitute(&gpe, pendulum_system.gpe, &pendulum_system)) goto fail;
-			total = ke + gpe;
+			struct energy energy = sim_get_energy(&pendulum_system);
 
 			if (info_str) {
 				nsec_t sim_time = get_time() - time;
@@ -164,7 +161,7 @@ int main(void) {
 				                          show_lag ? " (" : "",
 				                          show_lag ? (frame_skip ? "frame skipping" : "lagging") : "",
 				                          show_lag ? ")" : "",
-				                          sim_time, ke, gpe, total);
+				                          sim_time, energy.ke, energy.gpe, energy.ke + energy.gpe);
 				if (printf_res < 0 || printf_res >= info_str_size) goto fail;
 			}
 

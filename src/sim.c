@@ -19,9 +19,10 @@ bool sim_init(struct pendulum_system *system) {
 	CWRAPPER_OUTPUT_TYPE res = 0;
 
 	// initialise temp variables
-	basic temp, vx, vy, vlx, vly, half, one, t_angvel, t_angle;
+	basic temp, vx, vy, vlx, vly, half, one, t_angvel, t_angle, lagrangian, temp_solution;
 	CVecBasic *time_args = NULL,
-	          *acc_system = NULL, *acc_solution = NULL, *acc_symbol = NULL;
+	          *angacc_system = NULL, *angacc_solution = NULL, *angacc_symbol = NULL,
+	          *system_args = NULL, *system_expr = NULL;
 	CMapBasicBasic *to_func_subs = NULL, *to_sym_subs = NULL;
 	basic_new_stack(temp);
 	basic_new_stack(vx);
@@ -30,20 +31,17 @@ bool sim_init(struct pendulum_system *system) {
 	basic_new_stack(vly);
 	basic_new_stack(half);
 	basic_new_stack(one);
-	basic_new_stack(t_angvel);
-	basic_new_stack(t_angle);
 
 	// initialise system symbols
 	HEAP_ALLOC(system->sym_gravity);
-	HEAP_ALLOC(system->ke);
-	HEAP_ALLOC(system->gpe);
-	HEAP_ALLOC(system->lagrangian);
-	HEAP_ALLOC(system->time);
+	HEAP_ALLOC(system->sym_ke);
+	HEAP_ALLOC(system->sym_gpe);
+	HEAP_ALLOC(system->sym_time);
 
 	ASSERT(symbol_set(system->sym_gravity, "g"));
-	ASSERT(symbol_set(system->time, "t"));
-	basic_const_zero(system->ke);
-	basic_const_zero(system->gpe);
+	ASSERT(symbol_set(system->sym_time, "t"));
+	basic_const_zero(system->sym_ke);
+	basic_const_zero(system->sym_gpe);
 	basic_const_zero(vx);
 	basic_const_zero(vy);
 	ASSERT(rational_set_ui(half, 1, 2));
@@ -51,20 +49,7 @@ bool sim_init(struct pendulum_system *system) {
 
 	time_args = vecbasic_new();
 	if (!time_args) goto fail;
-	vecbasic_push_back(time_args, system->time);
-
-	acc_system = vecbasic_new();
-	if (!acc_system) goto fail;
-	acc_solution = vecbasic_new();
-	if (!acc_solution) goto fail;
-	acc_symbol = vecbasic_new();
-	if (!acc_symbol) goto fail;
-
-	to_func_subs = mapbasicbasic_new();
-	if (!to_func_subs) goto fail;
-
-	to_sym_subs = mapbasicbasic_new();
-	if (!to_sym_subs) goto fail;
+	ASSERT(vecbasic_push_back(time_args, system->sym_time));
 
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
@@ -78,8 +63,6 @@ bool sim_init(struct pendulum_system *system) {
 		HEAP_ALLOC(p->func_angle);
 		HEAP_ALLOC(p->func_angvel);
 		HEAP_ALLOC(p->func_angacc);
-		HEAP_ALLOC(p->equation_of_motion);
-		HEAP_ALLOC(p->solution_angacc);
 
 		// create unique name for the variable
 		unsigned str_size = 16 + log10i(i);
@@ -102,8 +85,8 @@ bool sim_init(struct pendulum_system *system) {
 		// define angle and angular velocity functions
 		str[0] = 'f';
 		ASSERT(function_symbol_set(p->func_angle, str, time_args));
-		ASSERT(basic_diff(p->func_angvel, p->func_angle, system->time));
-		ASSERT(basic_diff(p->func_angacc, p->func_angvel, system->time));
+		ASSERT(basic_diff(p->func_angvel, p->func_angle, system->sym_time));
+		ASSERT(basic_diff(p->func_angacc, p->func_angvel, system->sym_time));
 
 		// define the kinetic energy
 
@@ -128,7 +111,7 @@ bool sim_init(struct pendulum_system *system) {
 		ASSERT(basic_mul(temp, temp, half));
 
 		// add value, KE=0.5mv^2
-		ASSERT(basic_add(system->ke, system->ke, temp));
+		ASSERT(basic_add(system->sym_ke, system->sym_ke, temp));
 
 		// define the gravitational potential energy
 
@@ -139,11 +122,18 @@ bool sim_init(struct pendulum_system *system) {
 		ASSERT(basic_mul(temp, temp, p->sym_mass));        // multiply by mass
 
 		// add value, GPE=mgh
-		ASSERT(basic_add(system->gpe, system->gpe, temp));
+		ASSERT(basic_add(system->sym_gpe, system->sym_gpe, temp));
 	}
 
+	to_func_subs = mapbasicbasic_new();
+	if (!to_func_subs) goto fail;
+
+	to_sym_subs = mapbasicbasic_new();
+	if (!to_sym_subs) goto fail;
+
 	// define the Lagrangian function
-	ASSERT(basic_sub(system->lagrangian, system->ke, system->gpe)); // L = T (kinetic) - V (potential)
+	basic_new_stack(lagrangian);
+	ASSERT(basic_sub(lagrangian, system->sym_ke, system->sym_gpe)); // L = T (kinetic) - V (potential)
 
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
@@ -157,18 +147,30 @@ bool sim_init(struct pendulum_system *system) {
 		mapbasicbasic_insert(to_sym_subs, p->func_angle, p->sym_angle);
 	}
 
+	basic_new_stack(t_angvel);
+	basic_new_stack(t_angle);
+
+	angacc_system = vecbasic_new();
+	if (!angacc_system) goto fail;
+	angacc_solution = vecbasic_new();
+	if (!angacc_solution) goto fail;
+	angacc_symbol = vecbasic_new();
+	if (!angacc_symbol) goto fail;
+
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
+
+		HEAP_ALLOC(p->equation_of_motion);
 
 		// https://en.wikipedia.org/wiki/Lagrangian_mechanics#Equations_of_motion
 
 		// partially differentiate Lagrangian function
 		// these are taken separately for each axis
-		ASSERT(basic_diff(t_angle, system->lagrangian, p->sym_angle));
+		ASSERT(basic_diff(t_angle, lagrangian, p->sym_angle));
 		// note that angular velocity is treated as a separate variable to angle when finding this partial derivative,
 		// instead of as the derivative of the angle w.r.t. time
 		// see https://math.stackexchange.com/a/2085001
-		ASSERT(basic_diff(t_angvel, system->lagrangian, p->sym_angvel));
+		ASSERT(basic_diff(t_angvel, lagrangian, p->sym_angvel));
 
 		// implement Lagrange's equations
 
@@ -176,7 +178,7 @@ bool sim_init(struct pendulum_system *system) {
 		basic_subs(t_angvel, t_angvel, to_func_subs);
 
 		// differentiate t_angvel w.r.t. time
-		ASSERT(basic_diff(t_angvel, t_angvel, system->time));
+		ASSERT(basic_diff(t_angvel, t_angvel, system->sym_time));
 
 		// substitute symbols back in
 		basic_subs(t_angvel, t_angvel, to_sym_subs);
@@ -185,20 +187,51 @@ bool sim_init(struct pendulum_system *system) {
 		ASSERT(basic_sub(p->equation_of_motion, t_angvel, t_angle));
 
 		// add equation in system of equations to solve for angular acceleration
-		vecbasic_push_back(acc_system, p->equation_of_motion);
-		vecbasic_push_back(acc_symbol, p->sym_angacc);
+		ASSERT(vecbasic_push_back(angacc_system, p->equation_of_motion));
+		ASSERT(vecbasic_push_back(angacc_symbol, p->sym_angacc));
 	}
 
 	// solve system of equations for angular acceleration
-	ASSERT(vecbasic_linsolve(acc_solution, acc_system, acc_symbol));
+	ASSERT(vecbasic_linsolve(angacc_solution, angacc_system, angacc_symbol));
 
-	// assign solutions for each angular acceleration
+	system_args = vecbasic_new();
+	if (!system_args) goto fail;
+	ASSERT(vecbasic_push_back(system_args, system->sym_gravity));
 	for (unsigned i = 0; i < system->count; ++i) {
-		ASSERT(vecbasic_get(acc_solution, i, system->chain[i].solution_angacc));
+		struct pendulum *p = &system->chain[i];
+		ASSERT(vecbasic_push_back(system_args, p->sym_mass));
+		ASSERT(vecbasic_push_back(system_args, p->sym_length));
+		ASSERT(vecbasic_push_back(system_args, p->sym_angle));
+		ASSERT(vecbasic_push_back(system_args, p->sym_angvel));
 	}
 
-	ret = true;
+	system_expr = vecbasic_new();
+	if (!system_expr) goto fail;
+	ASSERT(vecbasic_push_back(system_expr, system->sym_ke));
+	ASSERT(vecbasic_push_back(system_expr, system->sym_gpe));
 
+	// JIT compile functions for numerically evaluating energy and each angular acceleration
+
+	// 1= common subexpression elimination
+	system->jit_energy = jit_visitor_new();
+	if (!system->jit_energy) goto fail;
+	jit_visitor_init(system->jit_energy, system_args, system_expr, 1);
+
+	vecbasic_free(system_expr);
+	system_expr = vecbasic_new();
+	if (!system_expr) goto fail;
+
+	basic_new_stack(temp_solution);
+	for (unsigned i = 0; i < system->count; ++i) {
+		ASSERT(vecbasic_get(angacc_solution, i, temp_solution));
+		ASSERT(vecbasic_push_back(system_expr, temp_solution));
+	}
+
+	system->jit_angacc_solutions = jit_visitor_new();
+	if (!system->jit_angacc_solutions) goto fail;
+	jit_visitor_init(system->jit_angacc_solutions, system_args, system_expr, 1); // 1= common subexpression elimination, 2= compile with -O2
+
+	ret = true;
 fail:
 	basic_free_stack(temp);
 	basic_free_stack(vx);
@@ -209,11 +242,15 @@ fail:
 	basic_free_stack(one);
 	basic_free_stack(t_angvel);
 	basic_free_stack(t_angle);
+	basic_free_stack(lagrangian);
+	basic_free_stack(temp_solution);
 
 	vecbasic_free(time_args);
-	vecbasic_free(acc_system);
-	vecbasic_free(acc_solution);
-	vecbasic_free(acc_symbol);
+	vecbasic_free(angacc_system);
+	vecbasic_free(angacc_solution);
+	vecbasic_free(angacc_symbol);
+	vecbasic_free(system_args);
+	vecbasic_free(system_expr);
 
 	mapbasicbasic_free(to_func_subs);
 	mapbasicbasic_free(to_sym_subs);
@@ -228,10 +265,11 @@ fail:
 
 bool sim_free(struct pendulum_system *system) {
 	HEAP_FREE(system->sym_gravity);
-	HEAP_FREE(system->ke);
-	HEAP_FREE(system->gpe);
-	HEAP_FREE(system->lagrangian);
-	HEAP_FREE(system->time);
+	HEAP_FREE(system->sym_ke);
+	HEAP_FREE(system->sym_gpe);
+	HEAP_FREE(system->sym_time);
+	jit_visitor_free(system->jit_energy);
+	jit_visitor_free(system->jit_angacc_solutions);
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
 		HEAP_FREE(p->sym_mass);
@@ -243,83 +281,59 @@ bool sim_free(struct pendulum_system *system) {
 		HEAP_FREE(p->func_angvel);
 		HEAP_FREE(p->func_angacc);
 		HEAP_FREE(p->equation_of_motion);
-		HEAP_FREE(p->solution_angacc);
 	}
 	return true;
 }
 
-static CWRAPPER_OUTPUT_TYPE basic_substitute(basic out, basic in, struct pendulum_system *system) {
-	CWRAPPER_OUTPUT_TYPE res = 0;
+#define JIT_OFFSET (1) // how many variables before first pendulum
+#define JIT_VARS (4)   // number of variables per pendulum
 
-	basic sym_number;
-	basic_new_stack(sym_number);
-
-	ASSERT(basic_assign(out, in));
-
-#define SUBS(symbol, number)                       \
-	ASSERT(real_double_set_d(sym_number, number)); \
-	ASSERT(basic_subs2(out, out, symbol, sym_number));
-
-	// substitute in real numbers
-	SUBS(system->sym_gravity, system->gravity);
-	for (int j = 0; j < system->count; ++j) {
-		struct pendulum *pend = &system->chain[j];
-		SUBS(pend->sym_mass, pend->mass);
-		SUBS(pend->sym_length, pend->length);
-		SUBS(pend->sym_angle, pend->angle);
-		SUBS(pend->sym_angvel, pend->angvel);
+static void substitute_jit_args(double *input, struct pendulum_system *system) {
+	size_t count = 0;
+	input[count++] = system->gravity;
+	for (unsigned i = 0; i < system->count; ++i) {
+		struct pendulum *p = &system->chain[i];
+		input[count++] = p->mass;
+		input[count++] = p->length;
+		input[count++] = p->angle;
+		input[count++] = p->angvel;
 	}
-
-#undef SUBS
-
-fail:
-	basic_free_stack(sym_number);
-	return res;
 }
 
-bool sim_substitute(double *out, basic in, struct pendulum_system *system) {
-	basic sym_out;
-	basic_new_stack(sym_out);
-	if (basic_substitute(sym_out, in, system)) {
-		basic_free_stack(sym_out);
-		return false;
-	}
+struct energy sim_get_energy(struct pendulum_system *system) {
+	double input[JIT_OFFSET + system->count * JIT_VARS];
+	substitute_jit_args(input, system);
 
-	*out = real_double_get_d(sym_out);
-	basic_free_stack(sym_out);
-	return true;
+	double output[2];
+	jit_visitor_call(system->jit_energy, output, input);
+
+	return (struct energy) {.ke = output[0], .gpe = output[1]};
 }
 
-static const int var_per_pendulum = 2;
+#define DYDT_VARS (2) // number of variables per pendulum
 
 static struct pendulum_system *dydt_system;
-static bool dydt_success;
+// static bool dydt_success;
+static double *dydt_inputs;
 
 static void dydt(double t, double y[], double out[]) {
 	struct pendulum_system *system = dydt_system;
 
-	// set all zeros beforehand as failsafe
-	for (int i = 0; i < system->count; ++i) out[i * var_per_pendulum] = 0, out[i * var_per_pendulum + 1] = 0;
-
-	for (int i = 0; i < system->count; ++i) {
-		struct pendulum *pend = &system->chain[i];
-
-		for (int j = 0; j < system->count; ++j) {
-			struct pendulum *pend2 = &system->chain[j];
-			// using values from the solver
-			pend2->angle = y[j * var_per_pendulum];
-			pend2->angvel = y[j * var_per_pendulum + 1];
-		}
-
-		double angacc;
-		if (!sim_substitute(&angacc, pend->solution_angacc, system)) goto fail;
-
-		out[i * var_per_pendulum] = y[i * var_per_pendulum + 1]; // angle changes by angular velocity
-		out[i * var_per_pendulum + 1] = angacc;                  // angular velocity changes by angular acceleration
+	// substitute variables in
+	for (unsigned i = 0; i < system->count; ++i) {
+		dydt_inputs[JIT_OFFSET + JIT_VARS * i + 2] = y[i * DYDT_VARS + 0]; // angle
+		dydt_inputs[JIT_OFFSET + JIT_VARS * i + 3] = y[i * DYDT_VARS + 1]; // angvel
 	}
 
-	dydt_success = true;
-fail:
+	double angacc[system->count];
+	jit_visitor_call(system->jit_angacc_solutions, angacc, dydt_inputs);
+
+	for (int i = 0; i < system->count; ++i) {
+		out[i * DYDT_VARS] = y[i * DYDT_VARS + 1]; // angle changes by angular velocity
+		out[i * DYDT_VARS + 1] = angacc[i];        // angular velocity changes by angular acceleration
+	}
+
+	// dydt_success = true;
 }
 
 bool sim_step(struct pendulum_system *system, int steps, double time_span) {
@@ -327,29 +341,40 @@ bool sim_step(struct pendulum_system *system, int steps, double time_span) {
 	if (time_span <= 0) return false;
 
 	dydt_system = system;
-	int variables = system->count * var_per_pendulum;
+	int variables = system->count * DYDT_VARS;
 	double tspan[2] = {0, time_span};
 	double y[variables * (steps + 1)];
 	double t[steps + 1];
 
-	// copy pendulum data into input
+	// copy pendulum data into rk4 input
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
-		y[i * var_per_pendulum] = p->angle;
-		y[i * var_per_pendulum + 1] = p->angvel;
+		y[i * DYDT_VARS] = p->angle;
+		y[i * DYDT_VARS + 1] = p->angvel;
+	}
+
+	double inputs[JIT_OFFSET + system->count * JIT_VARS];
+	dydt_inputs = inputs; // this is safe because this is only accessed in dydt which is only called here
+
+	// copy pendulum constants into JIT function input
+	inputs[0] = system->gravity;
+	for (unsigned i = 0; i < system->count; ++i) {
+		struct pendulum *p = &system->chain[i];
+		inputs[JIT_OFFSET + JIT_VARS * i + 0] = p->mass;
+		inputs[JIT_OFFSET + JIT_VARS * i + 1] = p->length;
 	}
 
 	// perform Runge-Kutta order 4
-	dydt_success = false;
+	// dydt_success = false;
 	rk4(dydt, tspan, y, steps, variables, t, y);
-	if (!dydt_success) return false;
+	// if (!dydt_success) return false;
 
-	// copy output back into pendulum data
+	// copy rk4 output back into pendulum data
 	double *final_y = &y[variables * steps];
 	for (unsigned i = 0; i < system->count; ++i) {
 		struct pendulum *p = &system->chain[i];
-		p->angle = final_y[i * var_per_pendulum];
-		p->angvel = final_y[i * var_per_pendulum + 1];
+		p->angle = final_y[i * DYDT_VARS];
+		p->angvel = final_y[i * DYDT_VARS + 1];
 	}
 
 	return true;
