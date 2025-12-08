@@ -1,6 +1,6 @@
 #define MAX_FPS 240
 #define SIMULATION_SPEED 1
-#define STEPS_PER_FRAME 1
+#define STEPS_PER_FRAME 100
 #define FRAME_SKIP true // frame skipping is non-deterministic
 #define SHOW_INFO true
 
