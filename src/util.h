@@ -63,4 +63,12 @@ struct rectf {
 
 struct rectf get_fit_rectf(struct posf inner_size, struct rectf frame_rect);
 struct posf map_rectf(struct posf pos, struct rectf from, struct rectf to);
+
+#define ASSERT(x)            \
+	{                        \
+		if (!(x)) goto fail; \
+	}
+#define ASSERT_SYM(x) ASSERT(!(sym_error = x))
+#define BASIC_FREE(x) (basic_free_heap(x))
+#define BASIC_NEW(x) ASSERT(x = basic_new_heap());
 #endif

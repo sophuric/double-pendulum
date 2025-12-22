@@ -1,5 +1,8 @@
 #include "sim.h"
 #include "rk4.h"
+#include "util.h"
+#include "linked_list.h"
+#include <stdint.h>
 
 static unsigned log10i(size_t x) {
 	unsigned i;
@@ -7,377 +10,468 @@ static unsigned log10i(size_t x) {
 	return i;
 }
 
-#define ASSERT(x) \
-	if ((res = (x))) goto fail
-#define HEAP_ALLOC(x) \
-	if (!(x = basic_new_heap())) goto fail
-#define HEAP_FREE(x) \
-	if (x) x = (basic_free_heap(x), NULL)
+static void sim_remove_unlinked_body(struct sim_body *body) {
+	if (!body) return;
+	// removes body without modifying prev/next
 
-bool sim_init(struct pendulum_system *system) {
-	bool ret = false;
-	CWRAPPER_OUTPUT_TYPE res = 0;
+	BASIC_FREE(body->sym_kinetic);
+	BASIC_FREE(body->sym_potential);
 
-	// initialise temp variables
-	basic temp, vx, vy, vlx, vly, height, half, one, t_angvel, t_angle, lagrangian, temp_solution;
-	CVecBasic *time_args = NULL,
-	          *angacc_system = NULL, *angacc_solution = NULL, *angacc_symbol = NULL,
-	          *system_args = NULL, *system_expr = NULL;
-	CMapBasicBasic *to_func_subs = NULL, *to_sym_subs = NULL;
-	basic_new_stack(temp);
-	basic_new_stack(vx);
-	basic_new_stack(vy);
-	basic_new_stack(vlx);
-	basic_new_stack(vly);
-	basic_new_stack(height);
-	basic_new_stack(half);
-	basic_new_stack(one);
+	if (body->sym_variables)
+		for (size_t i = 0; i < body->variables_len; ++i)
+			BASIC_FREE(body->sym_variables[i]);
 
-	// initialise system symbols
-	HEAP_ALLOC(system->sym_gravity);
-	HEAP_ALLOC(system->sym_ke);
-	HEAP_ALLOC(system->sym_gpe);
-	HEAP_ALLOC(system->sym_time);
+	if (body->sym_coordinates)
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			BASIC_FREE(body->sym_coordinates[i].position);
+			BASIC_FREE(body->sym_coordinates[i].velocity);
+		}
 
-	ASSERT(symbol_set(system->sym_gravity, "g"));
-	ASSERT(symbol_set(system->sym_time, "t"));
-	basic_const_zero(system->sym_ke);
-	basic_const_zero(system->sym_gpe);
-	basic_const_zero(vx);
-	basic_const_zero(vy);
-	basic_const_zero(height);
-	ASSERT(rational_set_ui(half, 1, 2));
-	basic_const_one(one);
+	free(body->sym_variables);
+	free(body->sym_coordinates);
+	free(body->in_variables);
+	free(body->coordinates);
+	free(body);
+}
 
-	time_args = vecbasic_new();
-	if (!time_args) goto fail;
-	ASSERT(vecbasic_push_back(time_args, system->sym_time));
+// helper macro to assert that snprintf succeeds
+#define SNPRINTF(str, size, ...)                                    \
+	{                                                               \
+		int snprintf_temp_var = snprintf(str, size, __VA_ARGS__);   \
+		ASSERT(snprintf_temp_var >= 0 && snprintf_temp_var < size); \
+	}
 
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
+struct sim_simulation *sim_new(CWRAPPER_OUTPUT_TYPE *error, size_t variables_len) {
+	// buffer string for defining symbols
+	const size_t str_length = 16 + log10i(SIZE_MAX);
+	char str[str_length];
 
-		// initialise symbols for pendulum
-		HEAP_ALLOC(p->sym_mass);
-		HEAP_ALLOC(p->sym_length);
-		HEAP_ALLOC(p->sym_angle);
-		HEAP_ALLOC(p->sym_angvel);
-		HEAP_ALLOC(p->sym_angacc);
-		HEAP_ALLOC(p->func_angle);
-		HEAP_ALLOC(p->func_angvel);
-		HEAP_ALLOC(p->func_angacc);
+	CWRAPPER_OUTPUT_TYPE sym_error = 0;
 
-		// create unique name for the variable
-		unsigned str_size = 16 + log10i(i);
-		char str[str_size];
-		int printf_res = snprintf(str, str_size, ".%u", i);
-		if (printf_res < 0 || printf_res >= str_size) goto fail;
+	struct sim_simulation *sim = calloc(1, sizeof(struct sim_simulation));
+	ASSERT(sim);
+
+	// allocate arrays
+
+	sim->variables_len = variables_len;
+	ASSERT(sim->sym_variables = calloc(variables_len, sizeof(*sim->sym_variables)));
+	ASSERT(sim->in_variables = calloc(variables_len, sizeof(*sim->in_variables)));
+
+	for (size_t i = 0; i < variables_len; ++i) {
+		sim_basic *c = &sim->sym_variables[i];
+		BASIC_NEW(*c);
+		SNPRINTF(str, str_length, "sim_var_%p", (void *) *c);
+		ASSERT_SYM(symbol_set(*c, str));
+	}
+	for (size_t i = 0; i < variables_len; ++i) sim->in_variables[i] = 0.0;
+
+	BASIC_NEW(sim->sym_time);
+	ASSERT_SYM(symbol_set(sim->sym_time, "t"));
+
+	BASIC_NEW(sim->sym_lagrangian);
+	ASSERT_SYM(symbol_set(sim->sym_lagrangian, "L"));
+
+	return sim;
+
+fail:
+	if (sym_error) *error = sym_error;
+	sim_remove(sim);
+	return NULL;
+}
+
+static void sim_remove_unlinked_constraint(struct sim_basic_list *constraint) {
+	if (!constraint) return;
+	// removes constraint without modifying prev/next
+	BASIC_FREE(constraint->basic);
+	free(constraint);
+}
+
+void sim_remove(struct sim_simulation *sim) {
+	if (!sim) return;
+
+	struct sim_body *remove_body;
+	LL_REMOVE_ALL(sim->bodies, remove_body, sim_remove_unlinked_body(remove_body));
+
+	struct sim_basic_list *remove_constraint;
+	LL_REMOVE_ALL(sim->constraints, remove_constraint, sim_remove_unlinked_constraint(remove_constraint));
+
+	if (sim->sym_variables)
+		for (size_t i = 0; i < sim->variables_len; ++i)
+			BASIC_FREE(sim->sym_variables[i]);
+
+	// free visitor functions
+	if (sim->internal_dydt_func) sim_visitor_free(sim->internal_dydt_func);
+	if (sim->internal_energy_func) sim_visitor_free(sim->internal_energy_func);
+
+	BASIC_FREE(sim->sym_time);
+	BASIC_FREE(sim->sym_lagrangian);
+
+	free(sim->in_variables);
+	free(sim->sym_variables);
+	free(sim->internal_func_args);
+	free(sim);
+}
+
+struct sim_basic_list *sim_new_constraint(CWRAPPER_OUTPUT_TYPE *error, struct sim_simulation *sim, sim_basic constraint, struct sim_basic_list *insert_before) {
+	CWRAPPER_OUTPUT_TYPE sym_error = 0;
+
+	struct sim_basic_list *con = calloc(1, sizeof(*con));
+	ASSERT(con);
+
+	BASIC_NEW(con->basic);
+	ASSERT_SYM(basic_assign(con->basic, constraint));
+
+	// add to linked list
+	LL_INSERT_BEFORE(con, sim->constraints, sim->constraints_last, insert_before);
+
+	return con;
+
+fail:
+	sim_remove_unlinked_constraint(con);
+	return NULL;
+}
+
+void sim_remove_constraint(struct sim_simulation *sim, struct sim_basic_list *constraint) {
+	if (!constraint) return;
+	LL_REMOVE(constraint, sim->constraints, sim->constraints_last);
+	sim_remove_unlinked_constraint(constraint);
+}
+
+struct sim_body *sim_new_body(CWRAPPER_OUTPUT_TYPE *error, struct sim_simulation *sim, size_t coordinates_len, size_t variables_len, struct sim_body *insert_before) {
+	// buffer string for defining symbols
+	const size_t str_length = 16 + log10i(SIZE_MAX);
+	char str[str_length];
+
+	CWRAPPER_OUTPUT_TYPE sym_error = 0;
+
+	struct sim_body *body = calloc(1, sizeof(*body));
+	ASSERT(body);
+
+	body->out_kinetic = 0.0, body->out_potential = 0.0;
+	body->coordinates_len = coordinates_len;
+	body->variables_len = variables_len;
+	body->variables_len = variables_len;
+
+	BASIC_NEW(body->sym_kinetic);
+	BASIC_NEW(body->sym_potential);
+
+	// allocate arrays
+
+	ASSERT(body->sym_variables = calloc(variables_len, sizeof(body->sym_variables)));
+	for (size_t i = 0; i < variables_len; ++i) {
+		sim_basic *c = &body->sym_variables[i];
+		BASIC_NEW(*c);
+		SNPRINTF(str, str_length, "body_var_%p", (void *) *c);
+		ASSERT_SYM(symbol_set(*c, str));
+	}
+
+	ASSERT(body->in_variables = calloc(variables_len, sizeof(body->in_variables)));
+	for (size_t i = 0; i < variables_len; ++i) body->in_variables[i] = 0.0;
+
+	ASSERT(body->sym_coordinates = calloc(coordinates_len, sizeof(body->sym_coordinates)));
+	for (size_t i = 0; i < coordinates_len; ++i) {
+		struct sim_sym_body_coordinate *c = &body->sym_coordinates[i];
 
 		// define symbols
-		str[0] = 'm';
-		ASSERT(symbol_set(p->sym_mass, str));
-		str[0] = 'l';
-		ASSERT(symbol_set(p->sym_length, str));
-		str[0] = 'x';
-		ASSERT(symbol_set(p->sym_angle, str));
-		str[0] = 'v';
-		ASSERT(symbol_set(p->sym_angvel, str));
-		str[0] = 'a';
-		ASSERT(symbol_set(p->sym_angacc, str));
 
-		// define angle and angular velocity functions
-		str[0] = 'f';
-		ASSERT(function_symbol_set(p->func_angle, str, time_args));
-		ASSERT(basic_diff(p->func_angvel, p->func_angle, system->sym_time));
-		ASSERT(basic_diff(p->func_angacc, p->func_angvel, system->sym_time));
+		BASIC_NEW(c->position);
+		SNPRINTF(str, str_length, "pos_%p", (void *) c);
+		ASSERT_SYM(symbol_set(c->position, str));
 
-		// define the kinetic energy
-
-		ASSERT(basic_sin(vlx, p->sym_angle));
-		ASSERT(basic_cos(vly, p->sym_angle));
-
-		ASSERT(basic_mul(temp, p->sym_length, p->sym_angvel)); // v = rω
-		ASSERT(basic_mul(vlx, vlx, temp));
-		ASSERT(basic_mul(vly, vly, temp));
-
-		// add velocity vector
-		ASSERT(basic_sub(vx, vx, vlx));
-		ASSERT(basic_add(vy, vy, vly));
-
-		// compute magnitude^2
-		ASSERT(basic_mul(vlx, vx, vx));
-		ASSERT(basic_mul(vly, vy, vy));
-		ASSERT(basic_add(temp, vlx, vly));
-
-		// multiply by mass and halve
-		ASSERT(basic_mul(temp, temp, p->sym_mass));
-		ASSERT(basic_mul(temp, temp, half));
-
-		// add value, KE=0.5mv^2
-		ASSERT(basic_add(system->sym_ke, system->sym_ke, temp));
-
-		// define the gravitational potential energy
-
-		ASSERT(basic_cos(vly, p->sym_angle));                 // cos is in the vertical axis, unlike the unit circle
-		ASSERT(basic_sub(vly, one, vly));                     // flip vertically
-		ASSERT(basic_mul(vly, vly, p->sym_length));           // multiply by length
-		ASSERT(basic_add(height, height, vly));               // add height
-		ASSERT(basic_mul(temp, height, system->sym_gravity)); // multiply by gravity
-		ASSERT(basic_mul(temp, temp, p->sym_mass));           // multiply by mass
-
-		// add value, GPE=mgh
-		ASSERT(basic_add(system->sym_gpe, system->sym_gpe, temp));
+		BASIC_NEW(c->velocity);
+		SNPRINTF(str, str_length, "vel_%p", (void *) c);
+		ASSERT_SYM(symbol_set(c->velocity, str));
 	}
 
-	to_func_subs = mapbasicbasic_new();
-	if (!to_func_subs) goto fail;
+	ASSERT(body->coordinates = calloc(coordinates_len, sizeof(struct sim_num_body_coordinate)));
+	for (size_t i = 0; i < coordinates_len; ++i) body->coordinates[i] = (struct sim_num_body_coordinate) {.position = 0.0, .velocity = 0.0};
 
-	to_sym_subs = mapbasicbasic_new();
-	if (!to_sym_subs) goto fail;
-
-	// define the Lagrangian function
-	basic_new_stack(lagrangian);
-	ASSERT(basic_sub(lagrangian, system->sym_ke, system->sym_gpe)); // L = T (kinetic) - V (potential)
-
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-
-		mapbasicbasic_insert(to_func_subs, p->sym_angacc, p->func_angacc);
-		mapbasicbasic_insert(to_func_subs, p->sym_angvel, p->func_angvel);
-		mapbasicbasic_insert(to_func_subs, p->sym_angle, p->func_angle);
-
-		mapbasicbasic_insert(to_sym_subs, p->func_angacc, p->sym_angacc);
-		mapbasicbasic_insert(to_sym_subs, p->func_angvel, p->sym_angvel);
-		mapbasicbasic_insert(to_sym_subs, p->func_angle, p->sym_angle);
-	}
-
-	basic_new_stack(t_angvel);
-	basic_new_stack(t_angle);
-
-	angacc_system = vecbasic_new();
-	if (!angacc_system) goto fail;
-	angacc_solution = vecbasic_new();
-	if (!angacc_solution) goto fail;
-	angacc_symbol = vecbasic_new();
-	if (!angacc_symbol) goto fail;
-
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-
-		HEAP_ALLOC(p->equation_of_motion);
-
-		// https://en.wikipedia.org/wiki/Lagrangian_mechanics#Equations_of_motion
-
-		// partially differentiate Lagrangian function
-		// these are taken separately for each axis
-		ASSERT(basic_diff(t_angle, lagrangian, p->sym_angle));
-		// note that angular velocity is treated as a separate variable to angle when finding this partial derivative,
-		// instead of as the derivative of the angle w.r.t. time
-		// see https://math.stackexchange.com/a/2085001
-		ASSERT(basic_diff(t_angvel, lagrangian, p->sym_angvel));
-
-		// implement Lagrange's equations
-
-		// convert into a function of time, so SymEngine doesn't think angle and angular velocity are constants and differentiates them to zero
-		basic_subs(t_angvel, t_angvel, to_func_subs);
-
-		// differentiate t_angvel w.r.t. time
-		ASSERT(basic_diff(t_angvel, t_angvel, system->sym_time));
-
-		// substitute symbols back in
-		basic_subs(t_angvel, t_angvel, to_sym_subs);
-
-		// final equation
-		ASSERT(basic_sub(p->equation_of_motion, t_angvel, t_angle));
-
-		// add equation in system of equations to solve for angular acceleration
-		ASSERT(vecbasic_push_back(angacc_system, p->equation_of_motion));
-		ASSERT(vecbasic_push_back(angacc_symbol, p->sym_angacc));
-	}
-
-	// solve system of equations for angular acceleration
-	ASSERT(vecbasic_linsolve(angacc_solution, angacc_system, angacc_symbol));
-
-	system_args = vecbasic_new();
-	if (!system_args) goto fail;
-	ASSERT(vecbasic_push_back(system_args, system->sym_gravity));
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		ASSERT(vecbasic_push_back(system_args, p->sym_mass));
-		ASSERT(vecbasic_push_back(system_args, p->sym_length));
-		ASSERT(vecbasic_push_back(system_args, p->sym_angle));
-		ASSERT(vecbasic_push_back(system_args, p->sym_angvel));
-	}
-
-	system_expr = vecbasic_new();
-	if (!system_expr) goto fail;
-	ASSERT(vecbasic_push_back(system_expr, system->sym_ke));
-	ASSERT(vecbasic_push_back(system_expr, system->sym_gpe));
-
-	// JIT compile functions for numerically evaluating energy and each angular acceleration
-
-	// 1= common subexpression elimination
-	system->jit_energy = jit_visitor_new();
-	if (!system->jit_energy) goto fail;
-	jit_visitor_init(system->jit_energy, system_args, system_expr, 1);
-
-	vecbasic_free(system_expr);
-	system_expr = vecbasic_new();
-	if (!system_expr) goto fail;
-
-	basic_new_stack(temp_solution);
-	for (unsigned i = 0; i < system->count; ++i) {
-		ASSERT(vecbasic_get(angacc_solution, i, temp_solution));
-		ASSERT(vecbasic_push_back(system_expr, temp_solution));
-	}
-
-	system->jit_angacc_solutions = jit_visitor_new();
-	if (!system->jit_angacc_solutions) goto fail;
-	jit_visitor_init(system->jit_angacc_solutions, system_args, system_expr, 1); // 1= common subexpression elimination, 2= compile with -O2
-
-	ret = true;
+	// add to linked list
+	LL_INSERT_BEFORE(body, sim->bodies, sim->bodies_last, insert_before);
+	return body;
 fail:
-	basic_free_stack(temp);
-	basic_free_stack(vx);
-	basic_free_stack(vy);
-	basic_free_stack(vlx);
-	basic_free_stack(vly);
-	basic_free_stack(half);
-	basic_free_stack(one);
-	basic_free_stack(t_angvel);
-	basic_free_stack(t_angle);
-	basic_free_stack(lagrangian);
-	basic_free_stack(temp_solution);
+	if (sym_error) *error = sym_error;
+	sim_remove_unlinked_body(body);
+	return NULL;
+}
 
+void sim_remove_body(struct sim_simulation *sim, struct sim_body *body) {
+	if (!body) return;
+	LL_REMOVE(body, sim->bodies, sim->bodies_last);
+	sim_remove_unlinked_body(body);
+}
+
+bool sim_compile(CWRAPPER_OUTPUT_TYPE *error, struct sim_simulation *sim) {
+	// buffer string for defining symbols
+	const size_t str_length = 16 + log10i(SIZE_MAX);
+	char str[str_length];
+	bool res = false;
+
+	CWRAPPER_OUTPUT_TYPE sym_error = 0;
+
+	free(sim->internal_func_args);
+	sim->internal_func_args = NULL;
+
+	// free visitor functions
+	sim_visitor_free(sim->internal_dydt_func);
+	sim_visitor_free(sim->internal_energy_func);
+	sim->internal_dydt_func = NULL;
+	sim->internal_energy_func = NULL;
+
+	// initialise variables
+
+	CVecBasic *visitor_args = NULL, *system_equations = NULL, *acc_solutions = NULL, *acc_vars = NULL, *dydt_output = NULL, *energy_output = NULL, *time_args = NULL;
+	CMapBasicBasic *to_func_subs = NULL, *to_sym_subs = NULL;
+	sim_basic lagrangian = NULL, temp = NULL, temp2 = NULL;
+	size_t coordinates_len = 0;
+
+	BASIC_NEW(temp);
+	BASIC_NEW(temp2);
+
+	// initialise time arguments
+	ASSERT(time_args = vecbasic_new());
+	ASSERT_SYM(vecbasic_push_back(time_args, sim->sym_time));
+
+	// initialise args for visitor functions
+	ASSERT(visitor_args = vecbasic_new());
+
+	// add simulation variables
+	for (size_t i = 0; i < sim->variables_len; ++i)
+		ASSERT_SYM(vecbasic_push_back(visitor_args, sim->sym_variables[i]));
+
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		// add body other variables
+		for (size_t i = 0; i < body->variables_len; ++i) ASSERT_SYM(vecbasic_push_back(visitor_args, body->sym_variables[i]));
+	}
+
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		// add body coordinates
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			++coordinates_len;
+			ASSERT_SYM(vecbasic_push_back(visitor_args, body->sym_coordinates[i].position));
+			ASSERT_SYM(vecbasic_push_back(visitor_args, body->sym_coordinates[i].velocity));
+		}
+	}
+
+	// initialise args array for calling visitor functions
+	ASSERT(sim->internal_func_args = calloc(vecbasic_size(visitor_args), sizeof(*sim->internal_func_args)));
+
+	// initialise map to substitute variables with their function of time variables
+	ASSERT(to_func_subs = mapbasicbasic_new());
+	ASSERT(to_sym_subs = mapbasicbasic_new());
+	ASSERT(acc_vars = vecbasic_new());
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			struct sim_sym_body_coordinate *coordinate = &body->sym_coordinates[i];
+
+			SNPRINTF(str, str_length, "func_%p", (void *) coordinate);
+			ASSERT_SYM(function_symbol_set(temp, str, time_args)); // define position as a function of time
+			mapbasicbasic_insert(to_func_subs, coordinate->position, temp);
+			mapbasicbasic_insert(to_sym_subs, temp, coordinate->position);
+
+			ASSERT_SYM(basic_diff(temp, temp, sim->sym_time)); // velocity
+			mapbasicbasic_insert(to_func_subs, coordinate->velocity, temp);
+			mapbasicbasic_insert(to_sym_subs, temp, coordinate->velocity);
+
+			SNPRINTF(str, str_length, "acc_%p", (void *) coordinate);
+			ASSERT_SYM(symbol_set(temp2, str));
+			ASSERT_SYM(vecbasic_push_back(acc_vars, temp2));
+
+			ASSERT_SYM(basic_diff(temp, temp, sim->sym_time)); // acceleration
+			mapbasicbasic_insert(to_func_subs, temp2, temp);
+			mapbasicbasic_insert(to_sym_subs, temp, temp2);
+		}
+	}
+
+	BASIC_NEW(lagrangian);
+	basic_const_zero(lagrangian);
+	// L = T - V
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		ASSERT_SYM(basic_add(lagrangian, lagrangian, body->sym_kinetic));
+		ASSERT_SYM(basic_sub(lagrangian, lagrangian, body->sym_potential));
+	}
+
+	// TODO: constraint variables
+
+	// create equations of motion
+	ASSERT(system_equations = vecbasic_new());
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			struct sim_sym_body_coordinate *coordinate = &body->sym_coordinates[i];
+
+			// https://en.wikipedia.org/wiki/Lagrangian_mechanics#Equations_of_motion
+
+			// partially differentiate Lagrangian function
+			// these are taken separately for each coordinate
+			ASSERT_SYM(basic_diff(temp, lagrangian, coordinate->position)); // ∂L/∂q
+
+			// note that velocity is treated as a separate variable to position when finding this partial derivative,
+			// instead of as the derivative of the position w.r.t. time
+			// see https://math.stackexchange.com/a/2085001
+			ASSERT_SYM(basic_diff(temp2, lagrangian, coordinate->velocity)); // ∂L/∂q̇
+
+			// convert into a function of time, so SymEngine doesn't think angle and angular velocity are constants and differentiates them to zero
+			ASSERT_SYM(basic_subs(temp2, temp2, to_func_subs));
+			// differentiate w.r.t. time
+			ASSERT_SYM(basic_diff(temp2, temp2, sim->sym_time)); // d/dt (∂L/∂q̇)
+			ASSERT_SYM(basic_subs(temp2, temp2, to_sym_subs));
+
+			ASSERT_SYM(basic_sub(temp, temp, temp2));
+
+			// TODO: constraint variables
+
+			// add equation of motion as an equation to solve
+			ASSERT_SYM(vecbasic_push_back(system_equations, temp));
+		}
+	}
+
+	// solve for acceleration
+	ASSERT(acc_solutions = vecbasic_new());
+	ASSERT_SYM(vecbasic_linsolve(acc_solutions, system_equations, acc_vars));
+
+	// initialise output for time derivative visitor function
+	ASSERT(dydt_output = vecbasic_new());
+	size_t j = 0;
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			struct sim_sym_body_coordinate *coordinate = &body->sym_coordinates[i];
+			ASSERT_SYM(vecbasic_push_back(dydt_output, coordinate->velocity)); // dposition/dtime = velocity
+			ASSERT_SYM(vecbasic_get(acc_solutions, j++, temp));                // get acceleration
+			ASSERT_SYM(vecbasic_push_back(dydt_output, temp));                 // dvelocity/dtime = acceleration
+		}
+	}
+
+	// compile time derivative visitor function
+	ASSERT(sim->internal_dydt_func = sim_visitor_new());
+	sim_visitor_init(sim->internal_dydt_func, visitor_args, dydt_output, 1);
+
+	// initialise output for energy visitor function
+	ASSERT(energy_output = vecbasic_new());
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		ASSERT_SYM(vecbasic_push_back(energy_output, body->sym_kinetic));
+		ASSERT_SYM(vecbasic_push_back(energy_output, body->sym_potential));
+	}
+
+	// compile energy visitor function
+	ASSERT(sim->internal_energy_func = sim_visitor_new());
+	sim_visitor_init(sim->internal_energy_func, visitor_args, energy_output, 1);
+
+	res = true;
+fail:
+	// free everything
+	BASIC_FREE(lagrangian);
+	BASIC_FREE(temp);
+	BASIC_FREE(temp2);
+	vecbasic_free(visitor_args);
+	vecbasic_free(system_equations);
+	vecbasic_free(acc_solutions);
+	vecbasic_free(acc_vars);
+	vecbasic_free(dydt_output);
+	vecbasic_free(energy_output);
 	vecbasic_free(time_args);
-	vecbasic_free(angacc_system);
-	vecbasic_free(angacc_solution);
-	vecbasic_free(angacc_symbol);
-	vecbasic_free(system_args);
-	vecbasic_free(system_expr);
-
 	mapbasicbasic_free(to_func_subs);
 	mapbasicbasic_free(to_sym_subs);
 
-	if (!ret) {
-		if (res) fprintf(stderr, "SymEngine exception %d\n", res);
-		sim_free(system);
-	}
-
-	return ret;
+	if (res) return true;
+	sim_visitor_free(sim->internal_dydt_func);
+	sim_visitor_free(sim->internal_energy_func);
+	sim->internal_dydt_func = NULL;
+	sim->internal_energy_func = NULL;
+	if (sym_error) *error = sym_error;
+	return false;
 }
 
-bool sim_free(struct pendulum_system *system) {
-	HEAP_FREE(system->sym_gravity);
-	HEAP_FREE(system->sym_ke);
-	HEAP_FREE(system->sym_gpe);
-	HEAP_FREE(system->sym_time);
-	jit_visitor_free(system->jit_energy);
-	jit_visitor_free(system->jit_angacc_solutions);
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		HEAP_FREE(p->sym_mass);
-		HEAP_FREE(p->sym_length);
-		HEAP_FREE(p->sym_angle);
-		HEAP_FREE(p->sym_angvel);
-		HEAP_FREE(p->sym_angacc);
-		HEAP_FREE(p->func_angle);
-		HEAP_FREE(p->func_angvel);
-		HEAP_FREE(p->func_angacc);
-		HEAP_FREE(p->equation_of_motion);
-	}
-	return true;
-}
+struct dydt_data {
+	struct sim_simulation *simulation;
+	size_t coordinates_start_index;
+};
 
-#define JIT_OFFSET (1) // how many variables before first pendulum
-#define JIT_VARS (4)   // number of variables per pendulum
+static void dydt(double t, double y[], double out[], void *custom) {
+	struct dydt_data *data = custom;
+	struct sim_simulation *sim = data->simulation;
 
-static void substitute_jit_args(double *input, struct pendulum_system *system) {
-	size_t count = 0;
-	input[count++] = system->gravity;
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		input[count++] = p->mass;
-		input[count++] = p->length;
-		input[count++] = p->angle;
-		input[count++] = p->angvel;
-	}
-}
+	size_t rk4_i = 0, arg_i = data->coordinates_start_index;
 
-struct energy sim_get_energy(struct pendulum_system *system) {
-	double input[JIT_OFFSET + system->count * JIT_VARS];
-	substitute_jit_args(input, system);
-
-	double output[2];
-	jit_visitor_call(system->jit_energy, output, input);
-
-	return (struct energy) {.ke = output[0], .gpe = output[1]};
-}
-
-#define DYDT_VARS (2) // number of variables per pendulum
-
-static struct pendulum_system *dydt_system;
-// static bool dydt_success;
-static double *dydt_inputs;
-
-static void dydt(double t, double y[], double out[]) {
-	struct pendulum_system *system = dydt_system;
-
-	// substitute variables in
-	for (unsigned i = 0; i < system->count; ++i) {
-		dydt_inputs[JIT_OFFSET + JIT_VARS * i + 2] = y[i * DYDT_VARS + 0]; // angle
-		dydt_inputs[JIT_OFFSET + JIT_VARS * i + 3] = y[i * DYDT_VARS + 1]; // angvel
+	// copy body coordinates to visitor arguments
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		// copy body coordinates to rk4 variables
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			sim->internal_func_args[arg_i++] = y[rk4_i++]; // position
+			sim->internal_func_args[arg_i++] = y[rk4_i++]; // velocity
+		}
 	}
 
-	double angacc[system->count];
-	jit_visitor_call(system->jit_angacc_solutions, angacc, dydt_inputs);
-
-	for (int i = 0; i < system->count; ++i) {
-		out[i * DYDT_VARS] = y[i * DYDT_VARS + 1]; // angle changes by angular velocity
-		out[i * DYDT_VARS + 1] = angacc[i];        // angular velocity changes by angular acceleration
-	}
-
-	// dydt_success = true;
+	// run ODE function
+	sim_visitor_call(sim->internal_dydt_func, out, sim->internal_func_args);
 }
 
-bool sim_step(struct pendulum_system *system, int steps, double time_span) {
+bool sim_step(struct sim_simulation *sim, int steps, double time_span) {
 	if (steps < 1) return false;
 	if (time_span <= 0) return false;
 
-	dydt_system = system;
-	int variables = system->count * DYDT_VARS;
-	double tspan[2] = {0, time_span};
-	double y[variables * (steps + 1)];
-	double t[steps + 1];
+	size_t arg_i = 0;
 
-	// copy pendulum data into rk4 input
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		y[i * DYDT_VARS] = p->angle;
-		y[i * DYDT_VARS + 1] = p->angvel;
+	size_t rk4_len = 0; // number of coordinates to iterate through
+
+	size_t body_len = 0;
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		++body_len;
+		rk4_len += body->coordinates_len * 2;
+		if (rk4_len < 0) return false; // overflow
 	}
 
-	double inputs[JIT_OFFSET + system->count * JIT_VARS];
-	dydt_inputs = inputs; // this is safe because this is only accessed in dydt which is only called here
+	// initialise rk4 variables
 
-	// copy pendulum constants into JIT function input
-	inputs[0] = system->gravity;
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		inputs[JIT_OFFSET + JIT_VARS * i + 0] = p->mass;
-		inputs[JIT_OFFSET + JIT_VARS * i + 1] = p->length;
+	double tspan[2] = {0, time_span};
+
+	double rk4_coordinates[rk4_len * (steps + 1)];
+	double time_out[steps + 1];
+
+	// initialise visitor variables
+
+	for (size_t i = 0; i < sim->variables_len; ++i)
+		sim->internal_func_args[arg_i++] = sim->in_variables[i];
+
+	size_t rk4_i = 0;
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		for (size_t i = 0; i < body->variables_len; ++i)
+			sim->internal_func_args[arg_i++] = body->in_variables[i];
+		// skip setting position and velocity coordinates for internal_func_args, that is done in the dydt function
+
+		// copy body coordinates to rk4 variables
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			rk4_coordinates[rk4_i++] = body->coordinates[i].position;
+			rk4_coordinates[rk4_i++] = body->coordinates[i].velocity;
+		}
 	}
 
 	// perform Runge-Kutta order 4
-	// dydt_success = false;
-	rk4(dydt, tspan, y, steps, variables, t, y);
-	// if (!dydt_success) return false;
+	struct dydt_data data = {
+	        .simulation = sim,
+	        .coordinates_start_index = arg_i};
+	rk4(dydt, tspan, rk4_coordinates, steps, rk4_len, time_out, rk4_coordinates, &data);
 
-	// copy rk4 output back into pendulum data
-	double *final_y = &y[variables * steps];
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		p->angle = final_y[i * DYDT_VARS];
-		p->angvel = final_y[i * DYDT_VARS + 1];
+	rk4_i = rk4_len * steps; // index of last set of coordinates
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		for (size_t i = 0; i < body->coordinates_len; ++i) {
+			// copy coordinates into visitor arguments again to calculate energy values
+			sim->internal_func_args[arg_i++] = rk4_coordinates[rk4_i];     // position
+			sim->internal_func_args[arg_i++] = rk4_coordinates[rk4_i + 1]; // velocity
+			// and copy back into bodies
+			body->coordinates[i].position = rk4_coordinates[rk4_i++]; // position
+			body->coordinates[i].velocity = rk4_coordinates[rk4_i++]; // velocity
+		}
+	}
+
+	// perform energy calculations
+	double energy[2 * body_len];
+	sim_visitor_call(sim->internal_energy_func, energy, sim->internal_func_args);
+
+	// copy energy numbers into bodies
+	arg_i = 0;
+	LL_LOOP(struct sim_body *, body, sim->bodies) {
+		body->out_kinetic = energy[arg_i++];
+		body->out_potential = energy[arg_i++];
 	}
 
 	return true;

@@ -7,7 +7,6 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdint.h>
-#include <inttypes.h>
 #include <math.h>
 
 #define eprintf(...) fprintf(stderr, __VA_ARGS__)
@@ -16,17 +15,19 @@
 #include "sim.h"
 #include "util.h"
 
+static struct sim_simulation *simulation = NULL;
+static struct display_data display;
+
 #include "config.h"
 
 static bool running = false;
 
+#undef ASSERT
 #define ASSERT(func, ...)     \
 	if (!(func)) {            \
 		eprintf(__VA_ARGS__); \
 		res = false;          \
 	}
-
-static char *info_str = NULL;
 
 static bool stop(bool final) {
 	if (!running) return true;
@@ -34,9 +35,11 @@ static bool stop(bool final) {
 
 	bool res = true;
 	ASSERT(display_disable(&display), "Failed to deinitialise display\n");
-	ASSERT(sim_free(&pendulum_system), "Failed to deinitialise simulation\n");
+	if (final) {
+		free_simulation(simulation);
+		simulation = NULL;
+	}
 
-	if (final) FREE(info_str);
 	display.info = NULL;
 
 	return res;
@@ -47,7 +50,9 @@ static bool start(bool first) {
 	running = true;
 
 	bool res = true;
-	ASSERT(sim_init(&pendulum_system), "Failed to initialise simulation\n");
+	if (first) {
+		if (!simulation) ASSERT(simulation = init_simulation(), "Failed to initialise simulation\n");
+	}
 	ASSERT(display_enable(&display), "Failed to initialise display\n");
 
 	if (!res) stop(true);
@@ -83,10 +88,6 @@ static void signal_func(int signal) {
 	exit(signal == SIGINT ? 0 : 1);
 }
 
-#define SEC 1000000000
-
-typedef uintmax_t nsec_t;
-
 nsec_t get_time(void) {
 	struct timespec tp;
 	clock_gettime(CLOCK_MONOTONIC, &tp);
@@ -96,7 +97,11 @@ nsec_t get_time(void) {
 bool nsleep(nsec_t time) {
 	struct timespec tp = {.tv_sec = time / SEC, .tv_nsec = time % SEC};
 	return !nanosleep(&tp, NULL);
-};
+}
+
+static bool main_render_func(struct display_screen screen, void *render_data) {
+	return render_func(screen, (struct sim_simulation *) render_data);
+}
 
 int main(void) {
 	struct sigaction sa;
@@ -110,70 +115,45 @@ int main(void) {
 		sigaction(signal, &sa, NULL);
 	}
 
+	display = init_display();
 	if (!start(true)) return 3;
 
-	const static size_t info_str_size = 1024;
-
-	if (SHOW_INFO) {
-		info_str = malloc(info_str_size);
-		if (!info_str) goto fail;
-	}
-	display.info = info_str;
-
-	const nsec_t wait_time = SEC / (MAX_FPS);
+	const nsec_t wait_time = SEC / max_fps;
 	nsec_t dest = get_time(), dest_last = dest;
-	bool frame_skip = FRAME_SKIP;
-	bool lag = false, first = true;
-	nsec_t last_lag = 0, render_time = 0;
+	struct timing_info timing = {.first = true};
 
 	while (1) {
-		nsec_t time = get_time();
+		timing.time = get_time();
 
-		if (time > dest) dest = time + wait_time; // if more than one second has elapsed, reset the offset and wait until 1 second has passed since now
-		nsec_t delay = dest - time;               // wait until destination time
+		if (timing.time > dest) dest = timing.time + wait_time; // if more than one second has elapsed, reset the offset and wait until 1 second has passed since now
+		nsec_t delay = dest - timing.time;                      // wait until destination time
 
-		if (dest == time + wait_time || nsleep(delay)) {
-			nsec_t frame_time = dest - dest_last;
-			double time_advance = (SIMULATION_SPEED) * ((frame_skip ? frame_time : wait_time) / (double) SEC);
+		if (dest == timing.time + wait_time || nsleep(delay)) {
+			timing.frame_time = dest - dest_last;
+			double time_advance = simulation_speed * (((frame_skip ? timing.frame_time : wait_time) / (double) SEC));
 
-			time = get_time();
-			if (!first) {
-				if (!sim_step(&pendulum_system, (STEPS_PER_FRAME), time_advance)) goto fail;
+			timing.time = get_time();
+			if (!timing.first) {
+				if (!sim_step(simulation, steps_per_frame, time_advance)) goto fail;
 
-				if (frame_time != wait_time) {
-					lag = true;
-					last_lag = time;
+				if (timing.frame_time != wait_time) {
+					timing.lag = true;
+					timing.last_lag_time = timing.time;
 				}
 			}
-			bool show_lag = lag && time < last_lag + SEC;
 
-			struct energy energy = sim_get_energy(&pendulum_system);
+			timing.show_lag = timing.lag && timing.time < timing.last_lag_time + SEC;
+			timing.sim_time = get_time() - timing.time;
 
-			if (info_str) {
-				nsec_t sim_time = get_time() - time;
-				int printf_res = snprintf(info_str, info_str_size,
-				                          "             FPS: %10.3f Hz%s%s%s\n"
-				                          " Simulation time: %10" PRIuMAX " ns\n"
-				                          "     Render time: %10" PRIuMAX " ns\n"
-				                          "  Kinetic energy: %10.3f J\n"
-				                          "Potential energy: %10.3f J\n"
-				                          "    Total energy: %10.3f J\n",
-				                          SEC / (double) frame_time,
-				                          show_lag ? " (" : "",
-				                          show_lag ? (frame_skip ? "frame skipping" : "lagging") : "",
-				                          show_lag ? ")" : "",
-				                          sim_time, render_time,
-				                          energy.ke, energy.gpe, energy.ke + energy.gpe);
-				if (printf_res < 0 || printf_res >= info_str_size) goto fail;
-			}
+			if (!update_display_func(simulation, &display,&timing)) goto fail;
 
 			dest_last = dest;
 			dest += wait_time; // add delay amount to destination time so we can precisely run the code on that interval
-			first = false;
+			timing.first = false;
 		}
-		render_time = get_time();
-		if (!display_render(&display, &pendulum_system)) goto fail;
-		render_time = get_time() - render_time;
+		timing.render_time = get_time();
+		if (!display_render(&display, main_render_func, simulation)) goto fail;
+		timing.render_time = get_time() - timing.render_time;
 	}
 
 	return 0;

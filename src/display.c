@@ -14,17 +14,6 @@
 #define eprintf(...) \
 	if (dprintf(DISPLAY_FD, __VA_ARGS__) < 0) goto fail
 
-#define INDEX(pos, screen) ((size_t) (pos.y) * (size_t) (screen.w) + (size_t) (pos.x))
-
-#define CELL_IN_BOUNDS(pos, screen) ((pos).x >= 0 && (pos).y >= 0 && (pos).x < (screen).w && (pos).y < (screen).h)
-
-#define BIT_SET(char, mask, set) ((set) ? (char) | (mask) : (char) &~(mask))
-
-#define GET_CELL(pos, screen, type) (CELL_IN_BOUNDS(pos, screen) ? ((type *) screen.buf)[INDEX(pos, screen)] : 0)
-#define SET_CELL(pos, set, screen, type) \
-	if (CELL_IN_BOUNDS(pos, screen))     \
-	(((type *) screen.buf)[INDEX(pos, screen)] = set)
-
 bool display_enable(struct display_data *display) {
 	if (tcgetattr(DISPLAY_FD, &display->old_termios)) return false;
 
@@ -69,24 +58,6 @@ fail:
 	return false;
 }
 
-static void draw_line(struct posf pos1, struct posf pos2, bool set, struct display_screen screen) {
-	struct posf delta = posf_sub(pos1, pos2);
-
-	bool swap = fabsf(delta.y) > fabsf(delta.x);
-	if (swap) { // swap x and y if gradient > 1 (45° from horizontal), otherwise there will be gaps since it loops over x-values
-		SWAP_POSF(pos2);
-		SWAP_POSF(pos1);
-		SWAP_POSF(delta);
-	}
-	float gradient = delta.x != 0 ? delta.y / delta.x : 0;
-	if (delta.x < 0) SWAP(struct posf, pos2, pos1); // swap from/to values to make it easier to loop
-	for (size_t x = floorf(pos2.x); x <= ceilf(pos1.x); ++x) {
-		struct poss cell = POSS(x, roundf(gradient * (cell.x - pos2.x) + pos2.y)); // y=m*(x-x1)+y1
-		if (swap) SWAP_POSS(cell);
-		SET_CELL(cell, set, screen, char);
-	}
-}
-
 static bool init_screen(struct display_screen *screen, size_t item_size, struct poss size, bool *resize, bool *clear) {
 	if (resize && (!screen->buf || !poss_eq(screen->size, size))) *resize = true;
 	screen->size = size;
@@ -113,7 +84,7 @@ static bool init_screen(struct display_screen *screen, size_t item_size, struct 
 	return true;
 }
 
-bool display_render(struct display_data *display, struct pendulum_system *system) {
+bool display_render(struct display_data *display, bool (*render_func)(struct display_screen screen, void *render_data), void *render_data) {
 	bool res = false;
 
 	eprintf("\x1b[H"); // move to start
@@ -122,9 +93,7 @@ bool display_render(struct display_data *display, struct pendulum_system *system
 	if (ioctl(DISPLAY_FD, TIOCGWINSZ, &ioctl_term_size)) return false; // get terminal size
 	struct poss term_size = POSS(ioctl_term_size.ws_col, ioctl_term_size.ws_row);
 
-	struct posf stretch = POSF(2, 1);
-
-	const static struct poss block_size = POSS(2, 2); // adjust code for producing block character if changing this
+	const static struct poss block_size = {2, 2}; // adjust code for producing block character if changing this
 
 	// initialise terminal screen
 	bool resize = false, clear = false;
@@ -135,27 +104,7 @@ bool display_render(struct display_data *display, struct pendulum_system *system
 	if (!init_screen(&display->screen, 1, display->screen.size, &resize, &clear)) goto fail;
 	if (clear) memset(display->screen.buf, 0x00, display->screen.buf_size);
 
-	float total_length = 0;
-	for (unsigned i = 0; i < system->count; ++i) total_length += system->chain[i].length;
-
-	struct rectf
-	        rect_from = RECTF(-total_length, -total_length, total_length * 2, total_length * 2), // max distance the pendulum can reach
-	        rect_stretched = RECTF2(POSF2(0), stretch),
-	        rect_to = get_fit_rectf(rect_stretched.size, RECTF2(POSF2(0), poss2f(display->screen.size))); // letter-box rect to the display screen size
-
-	struct posf pend_t = POSF(0, 0);
-	for (unsigned i = 0; i < system->count; ++i) {
-		struct pendulum *p = &system->chain[i];
-		struct posf pend_f = pend_t;
-		pend_t.x += sin(p->angle) * p->length;
-		pend_t.y += cos(p->angle) * p->length;
-
-		// draw line
-		struct posf cell_f = map_rectf(pend_f, rect_from, rect_to),
-		            cell_t = map_rectf(pend_t, rect_from, rect_to);
-
-		draw_line(cell_f, cell_t, 1, display->screen);
-	}
+	if (!render_func(display->screen, render_data)) goto fail;
 
 	if (resize) eprintf("\x1b[2J"); // clear on resize
 	if (display->info) {
@@ -180,11 +129,11 @@ bool display_render(struct display_data *display, struct pendulum_system *system
 			for (rel_block.y = 0; rel_block.y < block_size.y; ++rel_block.y)
 				for (rel_block.x = 0; rel_block.x < block_size.x; ++rel_block.x) {
 					struct poss block = poss_add(screen_cell, rel_block);
-					if (!GET_CELL(block, display->screen, char)) continue;
+					if (!DISPLAY_GET_CELL(block, display->screen)) continue;
 					term_char |= 1 << (rel_block.y * block_size.x + rel_block.x); // set corresponding bit for the block character
 				}
-			if (!resize && GET_CELL(term_cell, display->term, int) != term_char) {
-				SET_CELL(term_cell, term_char, display->term, int);
+			if (!resize && DISPLAY_GET_CELL_TYPE(term_cell, display->term, int) != term_char) {
+				DISPLAY_SET_CELL_TYPE(term_cell, term_char, display->term, int);
 
 				static const char *chars[] = {" ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█"};
 				const char *c = chars[term_char];

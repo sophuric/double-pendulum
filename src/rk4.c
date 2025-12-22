@@ -1,4 +1,5 @@
 // https://people.sc.fsu.edu/~jburkardt/c_src/rk4/rk4.html
+// Adapted to add a void *custom argument
 # include <math.h>
 # include <stdio.h>
 # include <stdlib.h>
@@ -7,8 +8,8 @@
 
 /******************************************************************************/
 
-void rk4 ( void dydt ( double t, double u[], double f[] ), double tspan[2], 
-  double y0[], int n, int m, double t[], double y[] )
+void rk4 ( void dydt ( double t, double u[], double f[], void *custom ), double tspan[2], 
+  double y0[], int n, int m, double t[], double y[], void *custom )
 
 /******************************************************************************/
 /*
@@ -23,6 +24,7 @@ void rk4 ( void dydt ( double t, double u[], double f[] ), double tspan[2],
   Modified:
 
     22 April 2020
+	Adapted to add a void *custom argument - 13 December 2025
 
   Author:
 
@@ -87,28 +89,28 @@ void rk4 ( void dydt ( double t, double u[], double f[] ), double tspan[2],
     {
       u0[i] = y[i+j*m];
     }
-    dydt ( t0, u0, f0 );
+    dydt ( t0, u0, f0, custom );
 
     t1 = t0 + dt / 2.0;
     for ( i = 0; i < m; i++ )
     {
       u1[i] = u0[i] + dt * f0[i] / 2.0;
     }
-    dydt ( t1, u1, f1 );
+    dydt ( t1, u1, f1, custom );
 
     t2 = t0 + dt / 2.0;
     for ( i = 0; i < m; i++ )
     {
       u2[i] = u0[i] + dt * f1[i] / 2.0;
     }
-    dydt ( t2, u2, f2 );
+    dydt ( t2, u2, f2, custom );
 
     t3 = t0 + dt;
     for ( i = 0; i < m; i++ )
     {
       u3[i] = u0[i] + dt * f2[i];
     }
-    dydt ( t3, u3, f3 );
+    dydt ( t3, u3, f3, custom );
 
     t[j+1] = t[j] + dt;
     for ( i = 0; i < m; i++ )

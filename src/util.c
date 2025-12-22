@@ -36,4 +36,4 @@ struct rectf get_fit_rectf(struct posf inner_size, struct rectf frame_rect) {
 
 struct posf map_rectf(struct posf pos, struct rectf from, struct rectf to) {
 	return posf_add(posf_mul(posf_div(posf_sub(pos, from.pos), from.size), to.size), to.pos);
-};
+}

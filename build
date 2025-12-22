@@ -8,11 +8,11 @@ debug)
 	cc_args=(-Og -g)
 	;;
 *)
-	echo "./build (release|debug)" >&2
+	echo "./build (release|debug) examples/<file>.c" >&2
 	exit 1
 	;;
 esac
 
 shift
 mkdir -p out
-cc "${cc_args[@]}" "$@" -lm -lsymengine -Wall -Werror -Wno-error=unused-{{but-set-,}{parameter,variable},const-variable,function,label,local-typedefs,macros,value,variable} src/{main.c,display.c,sim.c,util.c,rk4.c} -o out/dpend
+cc "${cc_args[@]}" "$@" -lm -lsymengine -Wall -Wpedantic -Werror -Wno-error=unused-{{but-set-,}{parameter,variable},const-variable,function,label,local-typedefs,macros,value,variable} src/{main.c,display.c,sim.c,util.c,rk4.c,render.c} -o out/dpend
