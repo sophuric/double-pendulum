@@ -19,7 +19,7 @@ bool sim_init(struct pendulum_system *system) {
 	CWRAPPER_OUTPUT_TYPE res = 0;
 
 	// initialise temp variables
-	basic temp, vx, vy, vlx, vly, half, one, t_angvel, t_angle, lagrangian, temp_solution;
+	basic temp, vx, vy, vlx, vly, height, half, one, t_angvel, t_angle, lagrangian, temp_solution;
 	CVecBasic *time_args = NULL,
 	          *angacc_system = NULL, *angacc_solution = NULL, *angacc_symbol = NULL,
 	          *system_args = NULL, *system_expr = NULL;
@@ -29,6 +29,7 @@ bool sim_init(struct pendulum_system *system) {
 	basic_new_stack(vy);
 	basic_new_stack(vlx);
 	basic_new_stack(vly);
+	basic_new_stack(height);
 	basic_new_stack(half);
 	basic_new_stack(one);
 
@@ -44,6 +45,7 @@ bool sim_init(struct pendulum_system *system) {
 	basic_const_zero(system->sym_gpe);
 	basic_const_zero(vx);
 	basic_const_zero(vy);
+	basic_const_zero(height);
 	ASSERT(rational_set_ui(half, 1, 2));
 	basic_const_one(one);
 
@@ -115,11 +117,12 @@ bool sim_init(struct pendulum_system *system) {
 
 		// define the gravitational potential energy
 
-		ASSERT(basic_cos(vly, p->sym_angle)); // cos is in the vertical axis, unlike the unit circle
-		ASSERT(basic_sub(vly, one, vly));     // flip vertically
-		ASSERT(basic_mul(vly, vly, p->sym_length));
-		ASSERT(basic_mul(temp, vly, system->sym_gravity)); // multiply by gravity
-		ASSERT(basic_mul(temp, temp, p->sym_mass));        // multiply by mass
+		ASSERT(basic_cos(vly, p->sym_angle));                 // cos is in the vertical axis, unlike the unit circle
+		ASSERT(basic_sub(vly, one, vly));                     // flip vertically
+		ASSERT(basic_mul(vly, vly, p->sym_length));           // multiply by length
+		ASSERT(basic_add(height, height, vly));               // add height
+		ASSERT(basic_mul(temp, height, system->sym_gravity)); // multiply by gravity
+		ASSERT(basic_mul(temp, temp, p->sym_mass));           // multiply by mass
 
 		// add value, GPE=mgh
 		ASSERT(basic_add(system->sym_gpe, system->sym_gpe, temp));
